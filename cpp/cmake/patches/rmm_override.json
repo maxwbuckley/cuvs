@@ -1,0 +1,10 @@
+{
+  "packages": {
+    "rmm": {
+      "version": "25.12.00",
+      "git_url": "https://github.com/rapidsai/rmm.git",
+      "git_tag": "v25.12.00",
+      "source_subdir": "cpp"
+    }
+  }
+}

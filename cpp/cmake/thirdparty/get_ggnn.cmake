@@ -12,18 +12,12 @@ function(find_and_configure_ggnn)
   rapids_cpm_package_override("${patch_dir}/ggnn_override.json")
 
   include("${rapids-cmake-dir}/cpm/detail/package_details.cmake")
-  rapids_cpm_package_details(ggnn version repository tag shallow exclude)
-
-  include("${rapids-cmake-dir}/cpm/detail/generate_patch_command.cmake")
-  rapids_cpm_generate_patch_command(ggnn ${version} patch_command build_patch_only)
+  rapids_cpm_package_info(ggnn VERSION_VAR version FIND_VAR find_args CPM_VAR cpm_args)
 
   rapids_cpm_find(
-    ggnn ${version} ${build_patch_only}
+    ggnn ${version}
     GLOBAL_TARGETS ggnn::ggnn
-    CPM_ARGS
-    GIT_REPOSITORY ${repository}
-    GIT_TAG ${tag}
-    GIT_SHALLOW ${shallow} ${patch_command}
+    CPM_ARGS ${cpm_args}
     DOWNLOAD_ONLY ON
   )
 

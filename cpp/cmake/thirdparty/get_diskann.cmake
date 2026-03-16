@@ -15,14 +15,11 @@ function(find_and_configure_diskann)
   rapids_cpm_package_override("${patch_dir}/diskann_override.json")
 
   include("${rapids-cmake-dir}/cpm/detail/package_details.cmake")
-  rapids_cpm_package_details(diskann version repository tag shallow exclude)
+  rapids_cpm_package_info(diskann VERSION_VAR version FIND_VAR find_args CPM_VAR cpm_args)
 
-  include("${rapids-cmake-dir}/cpm/detail/generate_patch_command.cmake")
-  rapids_cpm_generate_patch_command(diskann ${version} patch_command build_patch_only)
-
-  rapids_cpm_find(diskann ${version} ${build_patch_only}
+  rapids_cpm_find(diskann ${version}
           GLOBAL_TARGETS diskann
-          CPM_ARGS
+          CPM_ARGS ${cpm_args}
           OPTIONS
           "PYBIND OFF"
           "UNIT_TEST OFF"

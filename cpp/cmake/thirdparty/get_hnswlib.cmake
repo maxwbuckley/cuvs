@@ -14,19 +14,12 @@ function(find_and_configure_hnswlib)
   rapids_cpm_package_override("${patch_dir}/hnswlib_override.json")
 
   include("${rapids-cmake-dir}/cpm/detail/package_details.cmake")
-  rapids_cpm_package_details(hnswlib version repository tag shallow exclude)
-
-  include("${rapids-cmake-dir}/cpm/detail/generate_patch_command.cmake")
-  rapids_cpm_generate_patch_command(hnswlib ${version} patch_command build_patch_only)
+  rapids_cpm_package_info(hnswlib VERSION_VAR version FIND_VAR find_args CPM_VAR cpm_args)
 
   rapids_cpm_find(
-    hnswlib ${version} ${build_patch_only}
+    hnswlib ${version}
     GLOBAL_TARGETS hnswlib hnswlib::hnswlib
-    CPM_ARGS
-    GIT_REPOSITORY ${repository}
-    GIT_TAG ${tag}
-    GIT_SHALLOW ${shallow} ${patch_command}
-    EXCLUDE_FROM_ALL ${exclude}
+    CPM_ARGS ${cpm_args}
     DOWNLOAD_ONLY ON
   )
 

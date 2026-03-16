@@ -7,7 +7,12 @@
 # Use RAPIDS_VERSION_MAJOR_MINOR from rapids_config.cmake
 set(RAFT_VERSION "${RAPIDS_VERSION_MAJOR_MINOR}")
 set(RAFT_FORK "rapidsai")
-set(RAFT_PINNED_TAG "${rapids-cmake-checkout-tag}")
+set(RAFT_PINNED_TAG "v25.12.00")
+
+# Load version overrides for transitive deps (rmm, CCCL)
+include("${rapids-cmake-dir}/cpm/package_override.cmake")
+rapids_cpm_package_override("${CMAKE_CURRENT_LIST_DIR}/../patches/cccl_override.json")
+rapids_cpm_package_override("${CMAKE_CURRENT_LIST_DIR}/../patches/rmm_override.json")
 
 function(find_and_configure_raft)
     set(oneValueArgs VERSION FORK PINNED_TAG BUILD_STATIC_DEPS ENABLE_NVTX ENABLE_MNMG_DEPENDENCIES CLONE_ON_PIN)

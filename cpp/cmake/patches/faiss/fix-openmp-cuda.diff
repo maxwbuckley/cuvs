@@ -1,0 +1,27 @@
+diff --git a/faiss/CMakeLists.txt b/faiss/CMakeLists.txt
+--- a/faiss/CMakeLists.txt
++++ b/faiss/CMakeLists.txt
+@@ -377,7 +377,8 @@ if(FAISS_ENABLE_IPO)
+   endif()
+ endif()
+
+-find_package(OpenMP REQUIRED)
++# Only require OpenMP for CXX, not CUDA (CUDA doesn't have OpenMP support)
++find_package(OpenMP REQUIRED COMPONENTS CXX)
+ target_link_libraries(faiss PRIVATE OpenMP::OpenMP_CXX)
+ target_link_libraries(faiss_avx2 PRIVATE OpenMP::OpenMP_CXX)
+ target_link_libraries(faiss_avx512 PRIVATE OpenMP::OpenMP_CXX)
+diff --git a/faiss/gpu/CMakeLists.txt b/faiss/gpu/CMakeLists.txt
+--- a/faiss/gpu/CMakeLists.txt
++++ b/faiss/gpu/CMakeLists.txt
+@@ -359,6 +359,9 @@ if(FAISS_ENABLE_GPU)
+   target_link_options(faiss_gpu_objs PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatbin.ld")
+
+
+   find_package(CUDAToolkit REQUIRED)
++  if(FAISS_ENABLE_CUVS)
++    find_package(OpenMP REQUIRED COMPONENTS CXX)
++  endif()
+   target_link_libraries(faiss_gpu_objs PRIVATE ${CUDA_LIBS} $<$<BOOL:${FAISS_ENABLE_CUVS}>:cuvs::cuvs> $<$<BOOL:${FAISS_ENABLE_CUVS}>:OpenMP::OpenMP_CXX>)
+   target_compile_options(faiss_gpu_objs PRIVATE
+     $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all

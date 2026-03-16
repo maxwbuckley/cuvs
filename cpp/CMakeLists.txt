@@ -183,6 +183,10 @@ include(cmake/modules/ConfigureCUDA.cmake)
 rapids_cpm_init()
 
 if(NOT BUILD_CPU_ONLY)
+  # Load CCCL override BEFORE rapids_cpm_cccl() to pin compatible version
+  include(${rapids-cmake-dir}/cpm/package_override.cmake)
+  rapids_cpm_package_override("${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/cccl_override.json")
+
   # We must find CCCL ourselves before raft so that we get the right version.
   include(${rapids-cmake-dir}/cpm/cccl.cmake)
   rapids_cpm_cccl(BUILD_EXPORT_SET cuvs-exports INSTALL_EXPORT_SET cuvs-exports)
@@ -285,6 +289,14 @@ if(NOT BUILD_CPU_ONLY)
     src/neighbors/detail/cagra/search_single_cta_half_uint32.cu
     src/neighbors/detail/cagra/search_single_cta_int8_uint32.cu
     src/neighbors/detail/cagra/search_single_cta_uint8_uint32.cu
+    src/neighbors/detail/cagra/search_single_cta_float_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_single_cta_half_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_single_cta_int8_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_single_cta_uint8_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_multi_cta_float_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_multi_cta_half_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_multi_cta_int8_uint32_roaring.cu
+    src/neighbors/detail/cagra/search_multi_cta_uint8_uint32_roaring.cu
   )
 
   file(GLOB_RECURSE compute_distance_sources "src/neighbors/detail/cagra/compute_distance_*.cu")
@@ -305,6 +317,7 @@ if(NOT BUILD_CPU_ONLY)
   target_include_directories(
     cuvs-cagra-search PRIVATE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                               "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../c/include>"
+                              "$<BUILD_INTERFACE:/mnt/c/Users/maxwb/Development/cu-roaring-filter/include>"
   )
   target_compile_options(
     cuvs-cagra-search PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUVS_CXX_FLAGS}>"
@@ -554,6 +567,7 @@ if(NOT BUILD_CPU_ONLY)
     cuvs_objs
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../c/include>"
+    PRIVATE "$<BUILD_INTERFACE:/mnt/c/Users/maxwb/Development/cu-roaring-filter/include>"
     INTERFACE "$<INSTALL_INTERFACE:include>"
   )
 

@@ -42,6 +42,12 @@ if(CUDA_LOG_COMPILE_TIME)
   list(APPEND CUVS_CUDA_FLAGS "--time=nvcc_compile_log.csv")
 endif()
 
+# GCC 13+ intrinsics (AMX, CMPccXADD) are not supported by nvcc's cudafe frontend.
+# Pre-include a header that suppresses them.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13")
+  list(APPEND CUVS_CUDA_FLAGS "--pre-include=${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvcc_pre_include.h")
+endif()
+
 list(APPEND CUVS_CUDA_FLAGS --expt-extended-lambda --expt-relaxed-constexpr)
 list(APPEND CUVS_CXX_FLAGS "-DCUDA_API_PER_THREAD_DEFAULT_STREAM")
 list(APPEND CUVS_CUDA_FLAGS "-DCUDA_API_PER_THREAD_DEFAULT_STREAM")
