@@ -1,8 +1,11 @@
 /*
- * Benchmark: CAGRA + Brute Force search with roaring_filter vs bitset_filter.
+ * Benchmark: CAGRA filtered search — roaring vs bitset
  *
- * Measures search latency and recall at various selectivities,
- * comparing native Roaring filter (no decompression) vs flat bitset filter.
+ * Compares four filter strategies across selectivities and dataset sizes:
+ *   1. bitset_filter    — cuVS native flat bitset (baseline)
+ *   2. roaring_warp     — compressed Roaring, warp-cooperative (CRoaring threshold)
+ *   3. roaring_promoted — compressed Roaring, all containers promoted to bitmap
+ *   4. no_filter        — unfiltered CAGRA search (reference)
  *
  * Build:
  *   cd cpp/bench/prims/core/build
@@ -17,10 +20,10 @@
 #include <cuvs/neighbors/common.hpp>
 #include <cuvs/neighbors/roaring_filter.cuh>
 
-// Only include what we need — avoid cu_roaring.cuh which pulls in CRoaring headers
 #include <cu_roaring/types.cuh>
 #include <cu_roaring/detail/utils.cuh>
 #include <cu_roaring/detail/upload_ids.cuh>
+#include <cu_roaring/detail/promote.cuh>
 #include <cu_roaring/detail/decompress.cuh>
 #include <cu_roaring/device/roaring_view.cuh>
 #include <cu_roaring/device/make_view.cuh>
@@ -39,7 +42,6 @@
 #include <random>
 #include <vector>
 
-// Forward declarations from cu_roaring library (avoids CRoaring header dependency)
 namespace cu_roaring {
 void build_key_bloom(GpuRoaring& bitmap, cudaStream_t stream);
 void gpu_roaring_free(GpuRoaring& bitmap);
@@ -49,19 +51,21 @@ void gpu_roaring_free(GpuRoaring& bitmap);
 // Helpers
 // ============================================================================
 struct Stats {
-  double median, mean, min_v, max_v, std_dev;
+  double median, mean, min_v, max_v, std_dev, p5, p95;
 };
 
 static Stats compute_stats(std::vector<double>& t)
 {
   std::sort(t.begin(), t.end());
-  int n      = t.size();
+  int n      = static_cast<int>(t.size());
   double sum = 0;
   for (auto v : t) sum += v;
   double mean = sum / n;
   double var  = 0;
   for (auto v : t) var += (v - mean) * (v - mean);
-  return {t[n / 2], mean, t[0], t[n - 1], std::sqrt(var / n)};
+  return {t[n / 2], mean, t[0], t[n - 1], std::sqrt(var / n),
+          t[std::max(0, (int)(n * 0.05))],
+          t[std::min(n - 1, (int)(n * 0.95))]};
 }
 
 static Stats bench_gpu(int warmup, int iters, std::function<void()> fn)
@@ -87,7 +91,6 @@ static Stats bench_gpu(int warmup, int iters, std::function<void()> fn)
   return compute_stats(times);
 }
 
-// Compute recall@k
 static double recall_at_k(const std::vector<uint32_t>& result,
                            const std::vector<uint32_t>& gt,
                            int k, int n_queries)
@@ -104,6 +107,15 @@ static double recall_at_k(const std::vector<uint32_t>& result,
   return static_cast<double>(total_found) / (n_queries * k);
 }
 
+static void write_stats_json(FILE* f, const char* prefix, const Stats& s)
+{
+  fprintf(f, "      \"%s_median_ms\": %.4f,\n", prefix, s.median);
+  fprintf(f, "      \"%s_mean_ms\": %.4f,\n", prefix, s.mean);
+  fprintf(f, "      \"%s_std_ms\": %.4f,\n", prefix, s.std_dev);
+  fprintf(f, "      \"%s_p5_ms\": %.4f,\n", prefix, s.p5);
+  fprintf(f, "      \"%s_p95_ms\": %.4f,\n", prefix, s.p95);
+}
+
 // ============================================================================
 // Main benchmark
 // ============================================================================
@@ -117,287 +129,229 @@ int main()
   printf("GPU: %s (%d SMs, %.0f MB)\n\n", prop.name, prop.multiProcessorCount,
          prop.totalGlobalMem / (1024.0 * 1024.0));
 
-  // ========================================================
-  // Parameters
-  // ========================================================
   constexpr int DIM       = 128;
   constexpr int K         = 10;
-  constexpr int N_QUERIES = 100;
-  constexpr int WARMUP    = 10;   // absorb JIT compilation
-  constexpr int ITERS     = 30;   // n>=30 per benchmarking rules
+  constexpr int WARMUP    = 10;
+  constexpr int ITERS     = 30;
 
   struct Config {
     const char* name;
     int n_vectors;
-    double filter_pass_rate;  // fraction of vectors that PASS the filter
+    int n_queries;
+    double filter_pass_rate;
   };
 
   Config configs[] = {
-    // Various selectivities (pass_rate = 1 - selectivity)
-    {"1M, 50% pass",    1000000,  0.50},
-    {"1M, 10% pass",    1000000,  0.10},
-    {"1M, 1% pass",     1000000,  0.01},
+    // 1M dataset — various selectivities
+    {"1M_50pct",  1000000, 100, 0.50},
+    {"1M_10pct",  1000000, 100, 0.10},
+    {"1M_1pct",   1000000, 100, 0.01},
+    // 1M throughput — large batch
+    {"1M_50pct_batch10K",  1000000, 10000, 0.50},
+    {"1M_10pct_batch10K",  1000000, 10000, 0.10},
   };
 
-  // Open results file
-  FILE* jf = fopen("results/raw/bench_cagra_roaring_search.json", "w");
-  if (!jf) jf = fopen("bench_cagra_roaring_search.json", "w");
+  FILE* jf = fopen("bench_cagra_roaring_search.json", "w");
   fprintf(jf, "{\n  \"benchmark\": \"cagra_roaring_search\",\n");
-  fprintf(jf, "  \"gpu\": \"%s\",\n", prop.name);
-  fprintf(jf, "  \"dim\": %d, \"k\": %d, \"n_queries\": %d,\n", DIM, K, N_QUERIES);
+  fprintf(jf, "  \"gpu\": \"%s\",\n  \"n_sms\": %d,\n",
+          prop.name, prop.multiProcessorCount);
+  fprintf(jf, "  \"dim\": %d, \"k\": %d,\n", DIM, K);
+  fprintf(jf, "  \"warmup\": %d, \"iters\": %d,\n", WARMUP, ITERS);
   fprintf(jf, "  \"results\": [\n");
 
   bool first_result = true;
 
   for (auto& cfg : configs) {
     int N = cfg.n_vectors;
-    printf("=== %s (N=%d, dim=%d, k=%d) ===\n", cfg.name, N, DIM, K);
+    int NQ = cfg.n_queries;
+    printf("=== %s (N=%d, NQ=%d, dim=%d, k=%d, pass=%.0f%%) ===\n",
+           cfg.name, N, NQ, DIM, K, cfg.filter_pass_rate * 100);
     fflush(stdout);
 
-    // Generate random dataset
-    printf("  Generating dataset...\n");
-    fflush(stdout);
+    // Generate dataset
     auto dataset = raft::make_device_matrix<float, int64_t>(res, N, DIM);
-    auto queries = raft::make_device_matrix<float, int64_t>(res, N_QUERIES, DIM);
-
-    // Fill with random data using thrust
+    auto queries = raft::make_device_matrix<float, int64_t>(res, NQ, DIM);
     {
       std::mt19937 rng(42);
       std::uniform_real_distribution<float> fdist(-1.0f, 1.0f);
       std::vector<float> h_data(static_cast<size_t>(N) * DIM);
       for (auto& v : h_data) v = fdist(rng);
       raft::update_device(dataset.data_handle(), h_data.data(), h_data.size(), stream);
-
-      std::vector<float> h_queries(static_cast<size_t>(N_QUERIES) * DIM);
+      std::vector<float> h_queries(static_cast<size_t>(NQ) * DIM);
       for (auto& v : h_queries) v = fdist(rng);
       raft::update_device(queries.data_handle(), h_queries.data(), h_queries.size(), stream);
       raft::resource::sync_stream(res);
     }
 
-    // Generate filter bitmap (on host, then upload)
-    printf("  Generating filter (%.1f%% pass rate)...\n", cfg.filter_pass_rate * 100);
-    fflush(stdout);
+    // Generate filter
     std::mt19937 gen(123);
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     std::vector<uint32_t> pass_ids;
-    for (int i = 0; i < N; ++i) {
-      if (dist(gen) < cfg.filter_pass_rate) pass_ids.push_back(i);
-    }
-    printf("  Filter: %zu vectors pass (%.2f%%)\n",
-           pass_ids.size(), 100.0 * pass_ids.size() / N);
+    for (int i = 0; i < N; ++i)
+      if (dist(gen) < cfg.filter_pass_rate) pass_ids.push_back(static_cast<uint32_t>(i));
+    printf("  Filter: %zu pass (%.2f%%)\n", pass_ids.size(), 100.0 * pass_ids.size() / N);
 
-    // Create GPU Roaring bitmap
-    auto gpu_roaring = cu_roaring::upload_from_sorted_ids(
-      pass_ids.data(), static_cast<uint32_t>(pass_ids.size()),
-      static_cast<uint32_t>(N));
-    cu_roaring::build_key_bloom(gpu_roaring, stream);
-    auto roaring_view = cu_roaring::make_view(gpu_roaring);
+    // ---- Build filter variants ----
 
-    // Create flat bitset
+    // 1. Flat bitset
     raft::core::bitset<uint32_t, int64_t> flat_bitset(res, static_cast<int64_t>(N), false);
-    // Set bits for pass_ids
     {
-      uint32_t n_words = (N + 31) / 32;
+      uint32_t n_words = (static_cast<uint32_t>(N) + 31) / 32;
       std::vector<uint32_t> h_bits(n_words, 0);
       for (auto id : pass_ids) h_bits[id / 32] |= (1u << (id % 32));
       raft::update_device(flat_bitset.data(), h_bits.data(), n_words, stream);
     }
+    size_t bitset_bytes = (static_cast<size_t>(N) + 31) / 32 * sizeof(uint32_t);
 
-    printf("  Roaring: %.2f MB (%u containers)  Flat: %.2f MB  Ratio: %.1fx\n",
-           gpu_roaring.n_containers * 8.0 / 1024 / 1024,  // approximate
-           gpu_roaring.n_containers,
-           (N / 8.0) / 1024 / 1024,
-           (N / 8.0) / std::max(1.0, gpu_roaring.n_containers * 8.0));
+    // 2. Roaring (default threshold — will have array containers at low density)
+    auto gpu_roaring_default = cu_roaring::upload_from_sorted_ids(
+      pass_ids.data(), static_cast<uint32_t>(pass_ids.size()),
+      static_cast<uint32_t>(N));
+    auto view_default = cu_roaring::make_view(gpu_roaring_default);
 
-    // ====================================
-    // Build CAGRA index
-    // ====================================
-    printf("  Building CAGRA index...\n");
-    fflush(stdout);
+    // 3. Roaring promoted (all containers → bitmap, no array binary search)
+    auto gpu_roaring_promoted = cu_roaring::upload_from_sorted_ids(
+      pass_ids.data(), static_cast<uint32_t>(pass_ids.size()),
+      static_cast<uint32_t>(N), 0, cu_roaring::PROMOTE_ALL);
+    auto view_promoted = cu_roaring::make_view(gpu_roaring_promoted);
 
+    // Memory stats
+    auto roaring_bytes = [](const cu_roaring::GpuRoaring& g) -> size_t {
+      return g.n_containers * (sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint16_t))
+           + static_cast<size_t>(g.n_bitmap_containers) * 1024 * sizeof(uint64_t);
+      // Array/run data not tracked in struct fields — approximate
+    };
+    size_t meta_default  = roaring_bytes(gpu_roaring_default);
+    size_t meta_promoted = roaring_bytes(gpu_roaring_promoted);
+
+    printf("  Memory: bitset=%.2fKB  roaring=%.2fKB (%.1fx)  promoted=%.2fKB (%.1fx)\n",
+           bitset_bytes / 1024.0,
+           meta_default / 1024.0,  bitset_bytes / std::max(1.0, (double)meta_default),
+           meta_promoted / 1024.0, bitset_bytes / std::max(1.0, (double)meta_promoted));
+    printf("  Containers: default=%u (bmp=%u arr=%u)  promoted=%u (all bmp)\n",
+           gpu_roaring_default.n_containers,
+           gpu_roaring_default.n_bitmap_containers,
+           gpu_roaring_default.n_array_containers,
+           gpu_roaring_promoted.n_containers);
+
+    // ---- Build CAGRA index ----
+    printf("  Building CAGRA index...\n"); fflush(stdout);
     cuvs::neighbors::cagra::index_params build_params;
-    build_params.graph_degree          = 32;
+    build_params.graph_degree              = 32;
     build_params.intermediate_graph_degree = 48;
-
     auto cagra_index = cuvs::neighbors::cagra::build(
-      res,
-      build_params,
-      raft::make_const_mdspan(dataset.view()));
+      res, build_params, raft::make_const_mdspan(dataset.view()));
 
-    printf("  CAGRA index built: graph_degree=%d\n", build_params.graph_degree);
-    fflush(stdout);
-
-    // Allocate output
-    auto neighbors_cagra = raft::make_device_matrix<uint32_t, int64_t>(res, N_QUERIES, K);
-    auto distances_cagra = raft::make_device_matrix<float, int64_t>(res, N_QUERIES, K);
+    auto neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, NQ, K);
+    auto distances = raft::make_device_matrix<float, int64_t>(res, NQ, K);
 
     cuvs::neighbors::cagra::search_params search_params;
     search_params.itopk_size = 256;
 
-    // ====================================
-    // CAGRA + No filter (baseline)
-    // ====================================
-    printf("  Benchmarking CAGRA...\n");
-    fflush(stdout);
-
+    // ---- Benchmark: No filter ----
     auto s_none = bench_gpu(WARMUP, ITERS, [&]() {
       cuvs::neighbors::cagra::search(
         res, search_params, cagra_index,
         raft::make_const_mdspan(queries.view()),
-        neighbors_cagra.view(), distances_cagra.view());
+        neighbors.view(), distances.view());
     });
-    printf("    No filter:      median=%.3f mean=%.3f std=%.3f ms\n",
-           s_none.median, s_none.mean, s_none.std_dev);
+    printf("  no_filter:        %.3f ms (std=%.3f)\n", s_none.median, s_none.std_dev);
 
-    // Get ground truth (no filter) for recall computation
-    std::vector<uint32_t> gt_none(N_QUERIES * K);
-    raft::update_host(gt_none.data(), neighbors_cagra.data_handle(), N_QUERIES * K, stream);
-    raft::resource::sync_stream(res);
-
-    // ====================================
-    // CAGRA + bitset_filter (flat bitset)
-    // ====================================
+    // ---- Benchmark: Bitset filter ----
     auto bitset_filt = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(
       flat_bitset.view());
-
     auto s_bitset = bench_gpu(WARMUP, ITERS, [&]() {
       cuvs::neighbors::cagra::search(
         res, search_params, cagra_index,
         raft::make_const_mdspan(queries.view()),
-        neighbors_cagra.view(), distances_cagra.view(),
-        bitset_filt);
+        neighbors.view(), distances.view(), bitset_filt);
     });
-
-    std::vector<uint32_t> r_bitset(N_QUERIES * K);
-    raft::update_host(r_bitset.data(), neighbors_cagra.data_handle(), N_QUERIES * K, stream);
+    std::vector<uint32_t> r_bitset(static_cast<size_t>(NQ) * K);
+    raft::update_host(r_bitset.data(), neighbors.data_handle(), r_bitset.size(), stream);
     raft::resource::sync_stream(res);
-    printf("    bitset_filter:  median=%.3f mean=%.3f std=%.3f ms\n",
-           s_bitset.median, s_bitset.mean, s_bitset.std_dev);
+    printf("  bitset_filter:    %.3f ms (std=%.3f)\n", s_bitset.median, s_bitset.std_dev);
 
-    // ====================================
-    // CAGRA + roaring_filter (native, no decompress)
-    // ====================================
-    auto roaring_filt = cuvs::neighbors::filtering::roaring_filter(
-      roaring_view, static_cast<uint32_t>(pass_ids.size()), static_cast<uint32_t>(N));
-
-    auto s_roaring = bench_gpu(WARMUP, ITERS, [&]() {
-      cuvs::neighbors::cagra::search(
-        res, search_params, cagra_index,
-        raft::make_const_mdspan(queries.view()),
-        neighbors_cagra.view(), distances_cagra.view(),
-        roaring_filt);
-    });
-
-    std::vector<uint32_t> r_roaring(N_QUERIES * K);
-    raft::update_host(r_roaring.data(), neighbors_cagra.data_handle(), N_QUERIES * K, stream);
-    raft::resource::sync_stream(res);
-    printf("    roaring_filter: median=%.3f mean=%.3f std=%.3f ms\n",
-           s_roaring.median, s_roaring.mean, s_roaring.std_dev);
-
-    // ====================================
-    // CAGRA + roaring_filter_warp
-    // ====================================
+    // ---- Benchmark: Roaring warp (default containers) ----
     auto roaring_warp_filt = cuvs::neighbors::filtering::roaring_filter_warp(
-      roaring_view, static_cast<uint32_t>(pass_ids.size()), static_cast<uint32_t>(N));
-
+      view_default, static_cast<uint32_t>(pass_ids.size()), static_cast<uint32_t>(N));
     auto s_roaring_warp = bench_gpu(WARMUP, ITERS, [&]() {
       cuvs::neighbors::cagra::search(
         res, search_params, cagra_index,
         raft::make_const_mdspan(queries.view()),
-        neighbors_cagra.view(), distances_cagra.view(),
-        roaring_warp_filt);
+        neighbors.view(), distances.view(), roaring_warp_filt);
     });
-
-    std::vector<uint32_t> r_roaring_warp(N_QUERIES * K);
-    raft::update_host(r_roaring_warp.data(), neighbors_cagra.data_handle(), N_QUERIES * K, stream);
+    std::vector<uint32_t> r_roaring_warp(static_cast<size_t>(NQ) * K);
+    raft::update_host(r_roaring_warp.data(), neighbors.data_handle(), r_roaring_warp.size(), stream);
     raft::resource::sync_stream(res);
-    printf("    roaring_warp:   median=%.3f mean=%.3f std=%.3f ms\n",
-           s_roaring_warp.median, s_roaring_warp.mean, s_roaring_warp.std_dev);
+    printf("  roaring_warp:     %.3f ms (std=%.3f)\n", s_roaring_warp.median, s_roaring_warp.std_dev);
 
-    // ====================================
-    // Compute recall (all filtered results vs bitset_filter as ground truth)
-    // ====================================
-    double recall_bitset  = recall_at_k(r_bitset, r_bitset, K, N_QUERIES);
-    double recall_roaring = recall_at_k(r_roaring, r_bitset, K, N_QUERIES);
-    double recall_warp    = recall_at_k(r_roaring_warp, r_bitset, K, N_QUERIES);
-
-    printf("    Recall@%d (vs bitset_filter ground truth):\n", K);
-    printf("      bitset_filter:  %.4f\n", recall_bitset);
-    printf("      roaring_filter: %.4f\n", recall_roaring);
-    printf("      roaring_warp:   %.4f\n", recall_warp);
-
-    // ====================================
-    // Brute Force search
-    // ====================================
-    printf("  Benchmarking Brute Force...\n");
-    fflush(stdout);
-
-    auto bf_index = cuvs::neighbors::brute_force::build(
-      res, raft::make_const_mdspan(dataset.view()),
-      cuvs::distance::DistanceType::L2Expanded);
-
-    auto neighbors_bf = raft::make_device_matrix<int64_t, int64_t>(res, N_QUERIES, K);
-    auto distances_bf = raft::make_device_matrix<float, int64_t>(res, N_QUERIES, K);
-
-    cuvs::neighbors::brute_force::search_params bf_params;
-
-    auto s_bf_none = bench_gpu(WARMUP, ITERS, [&]() {
-      cuvs::neighbors::brute_force::search(
-        res, bf_params, bf_index,
+    // ---- Benchmark: Roaring warp promoted (all bitmap) ----
+    auto roaring_promoted_filt = cuvs::neighbors::filtering::roaring_filter_warp(
+      view_promoted, static_cast<uint32_t>(pass_ids.size()), static_cast<uint32_t>(N));
+    auto s_roaring_promoted = bench_gpu(WARMUP, ITERS, [&]() {
+      cuvs::neighbors::cagra::search(
+        res, search_params, cagra_index,
         raft::make_const_mdspan(queries.view()),
-        neighbors_bf.view(), distances_bf.view());
+        neighbors.view(), distances.view(), roaring_promoted_filt);
     });
-    printf("    BF no filter:      median=%.3f mean=%.3f std=%.3f ms\n",
-           s_bf_none.median, s_bf_none.mean, s_bf_none.std_dev);
+    std::vector<uint32_t> r_roaring_promoted(static_cast<size_t>(NQ) * K);
+    raft::update_host(r_roaring_promoted.data(), neighbors.data_handle(), r_roaring_promoted.size(), stream);
+    raft::resource::sync_stream(res);
+    printf("  roaring_promoted: %.3f ms (std=%.3f)\n", s_roaring_promoted.median, s_roaring_promoted.std_dev);
 
-    auto s_bf_bitset = bench_gpu(WARMUP, ITERS, [&]() {
-      cuvs::neighbors::brute_force::search(
-        res, bf_params, bf_index,
-        raft::make_const_mdspan(queries.view()),
-        neighbors_bf.view(), distances_bf.view(),
-        bitset_filt);
-    });
-    printf("    BF bitset_filter:  median=%.3f mean=%.3f std=%.3f ms\n",
-           s_bf_bitset.median, s_bf_bitset.mean, s_bf_bitset.std_dev);
+    // ---- Recall ----
+    double recall_bitset   = recall_at_k(r_bitset, r_bitset, K, NQ);
+    double recall_warp     = recall_at_k(r_roaring_warp, r_bitset, K, NQ);
+    double recall_promoted = recall_at_k(r_roaring_promoted, r_bitset, K, NQ);
+    printf("  Recall@%d: bitset=%.4f  warp=%.4f  promoted=%.4f\n",
+           K, recall_bitset, recall_warp, recall_promoted);
 
-    // Note: brute_force may not have roaring_filter template instantiations
-    // If it crashes, we skip it
-    printf("\n");
+    // ---- Speedup summary ----
+    double spd_warp     = s_bitset.median / s_roaring_warp.median;
+    double spd_promoted = s_bitset.median / s_roaring_promoted.median;
+    printf("  Speedup vs bitset: warp=%.2fx  promoted=%.2fx\n", spd_warp, spd_promoted);
 
-    // Write JSON
+    // ---- Throughput (QPS) ----
+    double qps_none     = NQ / (s_none.median * 1e-3);
+    double qps_bitset   = NQ / (s_bitset.median * 1e-3);
+    double qps_warp     = NQ / (s_roaring_warp.median * 1e-3);
+    double qps_promoted = NQ / (s_roaring_promoted.median * 1e-3);
+    printf("  QPS: none=%.0f  bitset=%.0f  warp=%.0f  promoted=%.0f\n\n",
+           qps_none, qps_bitset, qps_warp, qps_promoted);
+
+    // ---- JSON ----
     if (!first_result) fprintf(jf, ",\n");
     first_result = false;
     fprintf(jf, "    {\n");
     fprintf(jf, "      \"config\": \"%s\",\n", cfg.name);
-    fprintf(jf, "      \"n_vectors\": %d,\n", N);
-    fprintf(jf, "      \"filter_pass_rate\": %.4f,\n", cfg.filter_pass_rate);
-    fprintf(jf, "      \"n_passing\": %zu,\n", pass_ids.size());
-    fprintf(jf, "      \"warmup\": %d, \"iters\": %d,\n", WARMUP, ITERS);
-    fprintf(jf, "      \"cagra_no_filter_median_ms\": %.4f,\n", s_none.median);
-    fprintf(jf, "      \"cagra_no_filter_mean_ms\": %.4f,\n", s_none.mean);
-    fprintf(jf, "      \"cagra_no_filter_std_ms\": %.4f,\n", s_none.std_dev);
-    fprintf(jf, "      \"cagra_bitset_median_ms\": %.4f,\n", s_bitset.median);
-    fprintf(jf, "      \"cagra_bitset_mean_ms\": %.4f,\n", s_bitset.mean);
-    fprintf(jf, "      \"cagra_bitset_std_ms\": %.4f,\n", s_bitset.std_dev);
-    fprintf(jf, "      \"cagra_roaring_median_ms\": %.4f,\n", s_roaring.median);
-    fprintf(jf, "      \"cagra_roaring_mean_ms\": %.4f,\n", s_roaring.mean);
-    fprintf(jf, "      \"cagra_roaring_std_ms\": %.4f,\n", s_roaring.std_dev);
-    fprintf(jf, "      \"cagra_roaring_warp_median_ms\": %.4f,\n", s_roaring_warp.median);
-    fprintf(jf, "      \"cagra_roaring_warp_mean_ms\": %.4f,\n", s_roaring_warp.mean);
-    fprintf(jf, "      \"cagra_roaring_warp_std_ms\": %.4f,\n", s_roaring_warp.std_dev);
+    fprintf(jf, "      \"n_vectors\": %d, \"n_queries\": %d,\n", N, NQ);
+    fprintf(jf, "      \"filter_pass_rate\": %.4f, \"n_passing\": %zu,\n",
+            cfg.filter_pass_rate, pass_ids.size());
+    fprintf(jf, "      \"bitset_bytes\": %zu, \"roaring_default_bytes\": %zu, \"roaring_promoted_bytes\": %zu,\n",
+            bitset_bytes, meta_default, meta_promoted);
+    fprintf(jf, "      \"n_containers\": %u, \"n_bitmap\": %u, \"n_array\": %u,\n",
+            gpu_roaring_default.n_containers,
+            gpu_roaring_default.n_bitmap_containers,
+            gpu_roaring_default.n_array_containers);
+    write_stats_json(jf, "no_filter", s_none);
+    write_stats_json(jf, "bitset", s_bitset);
+    write_stats_json(jf, "roaring_warp", s_roaring_warp);
+    write_stats_json(jf, "roaring_promoted", s_roaring_promoted);
     fprintf(jf, "      \"recall_bitset\": %.4f,\n", recall_bitset);
-    fprintf(jf, "      \"recall_roaring\": %.4f,\n", recall_roaring);
     fprintf(jf, "      \"recall_roaring_warp\": %.4f,\n", recall_warp);
-    fprintf(jf, "      \"bf_no_filter_median_ms\": %.4f,\n", s_bf_none.median);
-    fprintf(jf, "      \"bf_bitset_median_ms\": %.4f\n", s_bf_bitset.median);
+    fprintf(jf, "      \"recall_roaring_promoted\": %.4f,\n", recall_promoted);
+    fprintf(jf, "      \"speedup_warp_vs_bitset\": %.4f,\n", spd_warp);
+    fprintf(jf, "      \"speedup_promoted_vs_bitset\": %.4f,\n", spd_promoted);
+    fprintf(jf, "      \"qps_none\": %.0f, \"qps_bitset\": %.0f, \"qps_warp\": %.0f, \"qps_promoted\": %.0f\n",
+            qps_none, qps_bitset, qps_warp, qps_promoted);
     fprintf(jf, "    }");
 
-    cu_roaring::gpu_roaring_free(gpu_roaring);
+    cu_roaring::gpu_roaring_free(gpu_roaring_default);
+    cu_roaring::gpu_roaring_free(gpu_roaring_promoted);
   }
 
   fprintf(jf, "\n  ]\n}\n");
   fclose(jf);
-
-  printf("\n=== ALL BENCHMARKS COMPLETE ===\n");
+  printf("=== COMPLETE — results at bench_cagra_roaring_search.json ===\n");
   return 0;
 }

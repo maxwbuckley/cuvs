@@ -12,103 +12,52 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_G
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --pre-include ${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/nvcc_pre_include.h")
 endif()
 
-# Find raft and rmm via the cuVS build
+# Use conda-installed headers + libs for ABI consistency.
+# Local cuVS include dir for roaring_filter.cuh and roaring.hpp (not in conda).
+set(CONDA_PREFIX "/home/maxwb/miniconda3" CACHE PATH "Conda environment prefix")
 set(CUVS_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../build" CACHE PATH "cuVS build directory")
 
-# raft headers
-find_path(RAFT_INCLUDE_DIR raft/core/resources.hpp
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/raft-src/cpp/include
-    /home/maxwb/miniconda3/include
+# All headers from conda (consistent ABI with conda libcuvs + librmm)
+set(CONDA_INCLUDE "${CONDA_PREFIX}/include")
+# Local cuVS headers for roaring integration (header-only, no ABI dependency)
+set(CUVS_LOCAL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../../include")
+
+message(STATUS "CONDA_INCLUDE: ${CONDA_INCLUDE}")
+message(STATUS "CUVS_LOCAL_INCLUDE: ${CUVS_LOCAL_INCLUDE}")
+
+# Libraries from conda
+find_library(RMM_LIB rmm HINTS ${CONDA_PREFIX}/lib)
+find_library(CUVS_LIB cuvs HINTS ${CONDA_PREFIX}/lib)
+message(STATUS "RMM_LIB: ${RMM_LIB}")
+message(STATUS "CUVS_LIB: ${CUVS_LIB}")
+
+# CCCL from conda (in rapids/ subdir) — must go first to override system CUDA's CCCL
+set(CONDA_RAPIDS "${CONDA_PREFIX}/include/rapids")
+
+# Common include dirs: conda rapids CCCL first (overrides system CUDA CCCL),
+# then local cuVS for roaring headers, then conda standard headers.
+set(BENCH_INCLUDE_DIRS
+    ${CONDA_RAPIDS}
+    ${CUVS_LOCAL_INCLUDE}
+    ${CONDA_INCLUDE}
 )
 
-# rmm headers
-find_path(RMM_INCLUDE_DIR rmm/device_uvector.hpp
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/rmm-src/cpp/include
-    ${CUVS_BUILD_DIR}/_deps/rmm-src/include
-    /home/maxwb/miniconda3/include
+# Common compile options
+set(BENCH_COMPILE_DEFS
+    FMT_HEADER_ONLY=1
+    SPDLOG_FMT_EXTERNAL=0
+    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 )
-
-# cuvs headers
-set(CUVS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../include")
-
-# CCCL/thrust/libcudacxx headers (from build)
-find_path(CCCL_INCLUDE_DIR thrust/device_vector.h
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/cccl-src/thrust
-    ${CUVS_BUILD_DIR}/_deps/cccl-src/thrust/thrust
-    /home/maxwb/miniconda3/include
-)
-find_path(LIBCUDACXX_INCLUDE_DIR cuda/std/type_traits
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/cccl-src/libcudacxx/include
-    /home/maxwb/miniconda3/include
-)
-find_path(CUB_INCLUDE_DIR cub/cub.cuh
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/cccl-src/cub
-    /home/maxwb/miniconda3/include
-)
-
-message(STATUS "RAFT_INCLUDE_DIR: ${RAFT_INCLUDE_DIR}")
-message(STATUS "RMM_INCLUDE_DIR: ${RMM_INCLUDE_DIR}")
-message(STATUS "CUVS_INCLUDE_DIR: ${CUVS_INCLUDE_DIR}")
-message(STATUS "CCCL thrust: ${CCCL_INCLUDE_DIR}")
-message(STATUS "libcudacxx: ${LIBCUDACXX_INCLUDE_DIR}")
-message(STATUS "CUB: ${CUB_INCLUDE_DIR}")
 
 # Build benchmark + roaring source
 add_executable(roaring_bench
     roaring_bench.cu
     ../../../src/core/roaring/roaring.cu
 )
-
-target_include_directories(roaring_bench PRIVATE
-    ${CUVS_INCLUDE_DIR}
-    ${RAFT_INCLUDE_DIR}
-    ${RMM_INCLUDE_DIR}
-    ${CCCL_INCLUDE_DIR}
-    ${LIBCUDACXX_INCLUDE_DIR}
-    ${CUB_INCLUDE_DIR}
-)
-
-# Link against rmm from the cuVS build
-find_library(RMM_LIB rmm HINTS ${CUVS_BUILD_DIR}/_deps/rmm-build)
-message(STATUS "RMM_LIB: ${RMM_LIB}")
-
-# Link against libcuvs for raft::core::bitset template instantiations
-find_library(CUVS_LIB cuvs HINTS ${CUVS_BUILD_DIR})
-message(STATUS "CUVS_LIB: ${CUVS_LIB}")
-
+target_include_directories(roaring_bench PRIVATE ${BENCH_INCLUDE_DIRS})
 target_link_libraries(roaring_bench PRIVATE CUDA::cudart ${RMM_LIB} ${CUVS_LIB})
-
-# RMM uses spdlog
-find_path(SPDLOG_INCLUDE_DIR spdlog/spdlog.h
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/spdlog-src/include
-    /home/maxwb/miniconda3/include
-)
-find_path(FMT_INCLUDE_DIR fmt/format.h
-    HINTS
-    ${CUVS_BUILD_DIR}/_deps/fmt-src/include
-    /home/maxwb/miniconda3/include
-)
-if(SPDLOG_INCLUDE_DIR)
-    target_include_directories(roaring_bench PRIVATE ${SPDLOG_INCLUDE_DIR})
-endif()
-if(FMT_INCLUDE_DIR)
-    target_include_directories(roaring_bench PRIVATE ${FMT_INCLUDE_DIR})
-endif()
-
-target_compile_definitions(roaring_bench PRIVATE
-    FMT_HEADER_ONLY=1
-    SPDLOG_FMT_EXTERNAL=0
-)
-
-set_target_properties(roaring_bench PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+target_compile_definitions(roaring_bench PRIVATE ${BENCH_COMPILE_DEFS})
+set_target_properties(roaring_bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(roaring_bench PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
 )
@@ -116,65 +65,48 @@ target_compile_options(roaring_bench PRIVATE
 # cu-roaring-filter standalone library
 set(CU_ROARING_DIR "/mnt/c/Users/maxwb/Development/cu-roaring-filter" CACHE PATH "cu-roaring-filter dir")
 find_library(CU_ROARING_LIB cu_roaring_filter HINTS ${CU_ROARING_DIR}/build)
+find_library(CROARING_LIB roaring HINTS ${CU_ROARING_DIR}/build/third_party/CRoaring/src)
 message(STATUS "CU_ROARING_LIB: ${CU_ROARING_LIB}")
+message(STATUS "CROARING_LIB: ${CROARING_LIB}")
 
 # CAGRA + Brute Force search benchmark with roaring_filter
 add_executable(bench_cagra_roaring bench_cagra_roaring.cu)
-target_include_directories(bench_cagra_roaring PRIVATE
-    ${CUVS_INCLUDE_DIR}
-    ${RAFT_INCLUDE_DIR}
-    ${RMM_INCLUDE_DIR}
-    ${CCCL_INCLUDE_DIR}
-    ${LIBCUDACXX_INCLUDE_DIR}
-    ${CUB_INCLUDE_DIR}
-    ${CU_ROARING_DIR}/include
-)
+target_include_directories(bench_cagra_roaring PRIVATE ${BENCH_INCLUDE_DIRS} ${CU_ROARING_DIR}/include)
 target_link_libraries(bench_cagra_roaring PRIVATE
-    CUDA::cudart ${RMM_LIB} ${CUVS_LIB} ${CU_ROARING_LIB}
+    CUDA::cudart ${RMM_LIB} ${CUVS_LIB} ${CU_ROARING_LIB} ${CROARING_LIB}
 )
-if(SPDLOG_INCLUDE_DIR)
-    target_include_directories(bench_cagra_roaring PRIVATE ${SPDLOG_INCLUDE_DIR})
-endif()
-if(FMT_INCLUDE_DIR)
-    target_include_directories(bench_cagra_roaring PRIVATE ${FMT_INCLUDE_DIR})
-endif()
-target_compile_definitions(bench_cagra_roaring PRIVATE
-    FMT_HEADER_ONLY=1
-    SPDLOG_FMT_EXTERNAL=0
-    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
-)
-set_target_properties(bench_cagra_roaring PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+target_compile_definitions(bench_cagra_roaring PRIVATE ${BENCH_COMPILE_DEFS})
+set_target_properties(bench_cagra_roaring PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(bench_cagra_roaring PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
+)
+
+# Comprehensive CAGRA + Roaring benchmark (selectivity sweep, multi-AND, E2E)
+add_executable(bench_cagra_comprehensive bench_cagra_roaring_comprehensive.cu)
+target_include_directories(bench_cagra_comprehensive PRIVATE ${BENCH_INCLUDE_DIRS} ${CU_ROARING_DIR}/include)
+target_link_libraries(bench_cagra_comprehensive PRIVATE
+    CUDA::cudart ${RMM_LIB} ${CUVS_LIB} ${CU_ROARING_LIB} ${CROARING_LIB}
+)
+target_compile_definitions(bench_cagra_comprehensive PRIVATE ${BENCH_COMPILE_DEFS})
+set_target_properties(bench_cagra_comprehensive PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(bench_cagra_comprehensive PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
 )
 
 # Minimal CAGRA test
 add_executable(quick_test quick_test.cu)
-target_include_directories(quick_test PRIVATE
-    ${CUVS_INCLUDE_DIR}
-    ${RAFT_INCLUDE_DIR}
-    ${RMM_INCLUDE_DIR}
-    ${CCCL_INCLUDE_DIR}
-    ${LIBCUDACXX_INCLUDE_DIR}
-    ${CUB_INCLUDE_DIR}
-)
+target_include_directories(quick_test PRIVATE ${BENCH_INCLUDE_DIRS})
 target_link_libraries(quick_test PRIVATE CUDA::cudart ${RMM_LIB} ${CUVS_LIB})
-if(SPDLOG_INCLUDE_DIR)
-    target_include_directories(quick_test PRIVATE ${SPDLOG_INCLUDE_DIR})
-endif()
-if(FMT_INCLUDE_DIR)
-    target_include_directories(quick_test PRIVATE ${FMT_INCLUDE_DIR})
-endif()
-target_compile_definitions(quick_test PRIVATE
-    FMT_HEADER_ONLY=1
-    SPDLOG_FMT_EXTERNAL=0
-    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
-)
-set_target_properties(quick_test PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+target_compile_definitions(quick_test PRIVATE ${BENCH_COMPILE_DEFS})
+set_target_properties(quick_test PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(quick_test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
 )
+
+# Minimal crash test
+add_executable(test_upload_crash test_upload_crash.cu)
+target_include_directories(test_upload_crash PRIVATE ${BENCH_INCLUDE_DIRS} ${CU_ROARING_DIR}/include)
+target_link_libraries(test_upload_crash PRIVATE CUDA::cudart ${RMM_LIB} ${CUVS_LIB} ${CU_ROARING_LIB} ${CROARING_LIB})
+target_compile_definitions(test_upload_crash PRIVATE ${BENCH_COMPILE_DEFS})
+set_target_properties(test_upload_crash PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(test_upload_crash PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)

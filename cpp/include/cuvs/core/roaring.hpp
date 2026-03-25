@@ -75,6 +75,18 @@ struct gpu_roaring {
   rmm::device_uvector<uint16_t> run_data;
   uint32_t n_run_containers = 0;
 
+  // Direct-map key index: key_index[high16] = container index, or 0xFFFF.
+  // Replaces O(log n) binary search with O(1) table lookup.
+  rmm::device_uvector<uint16_t> key_index;
+  uint32_t max_key = 0;
+
+  // Complement optimization: when true, the stored set is the complement
+  // of the logical set. contains() results are flipped at query time.
+  bool negated = false;
+
+  // Total logical cardinality (number of set bits, before complement)
+  uint64_t total_cardinality = 0;
+
   /** Construct an empty GPU Roaring bitmap */
   explicit gpu_roaring(rmm::cuda_stream_view stream)
     : keys(0, stream),
@@ -83,7 +95,8 @@ struct gpu_roaring {
       cardinalities(0, stream),
       bitmap_data(0, stream),
       array_data(0, stream),
-      run_data(0, stream) {}
+      run_data(0, stream),
+      key_index(0, stream) {}
 
   gpu_roaring(gpu_roaring&&) = default;
   gpu_roaring& operator=(gpu_roaring&&) = default;
@@ -94,7 +107,7 @@ struct gpu_roaring {
     return keys.size() * sizeof(uint16_t) + types.size() * sizeof(roaring_container_type) +
            offsets.size() * sizeof(uint32_t) + cardinalities.size() * sizeof(uint16_t) +
            bitmap_data.size() * sizeof(uint64_t) + array_data.size() * sizeof(uint16_t) +
-           run_data.size() * sizeof(uint16_t);
+           run_data.size() * sizeof(uint16_t) + key_index.size() * sizeof(uint16_t);
   }
 
   /** Equivalent flat bitset size (bytes) */

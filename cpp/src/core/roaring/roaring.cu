@@ -119,6 +119,21 @@ gpu_roaring from_sorted_ids(raft::resources const& res,
       result.array_data.data(), h_array_pool.data(), h_array_pool.size(), stream);
   }
 
+  // Total cardinality
+  result.total_cardinality = static_cast<uint64_t>(n_ids);
+
+  // Build direct-map key index: key_index[key] = container_idx, 0xFFFF = absent
+  if (n > 0) {
+    result.max_key = h_keys[n - 1];
+    uint32_t ki_size = result.max_key + 1;
+    std::vector<uint16_t> h_key_index(ki_size, 0xFFFF);
+    for (uint32_t i = 0; i < n; ++i) {
+      h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
+    }
+    result.key_index.resize(ki_size, stream);
+    raft::update_device(result.key_index.data(), h_key_index.data(), ki_size, stream);
+  }
+
   raft::resource::sync_stream(res);
   return result;
 }
