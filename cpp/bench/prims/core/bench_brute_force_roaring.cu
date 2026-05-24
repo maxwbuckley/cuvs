@@ -1,19 +1,22 @@
 /*
- * Benchmark: CAGRA filtered search — roaring vs bitset
+ * Benchmark: Brute-force filtered search — roaring vs bitset
  *
- * Compares filter strategies with interleaved A/B measurement to eliminate
- * ordering bias (warm caches, settled GPU state).
+ * Compares filter strategies with interleaved A/B measurement.
+ * Brute-force computes full pairwise distances, then masks filtered entries.
+ * The filter affects only the masking step (not the GEMM), so differences
+ * are expected to be smaller than CAGRA where the filter is in the hot loop.
  *
  * Build:
  *   cd cpp/bench/prims/core/build
  *   cmake .. -DCMAKE_BUILD_TYPE=Release
- *   make -j bench_cagra_roaring
+ *   make -j bench_brute_force_roaring
+ *   CUDA_CACHE_MAXSIZE=8589934592 \
  *   LD_LIBRARY_PATH=../../../build:../../../build/_deps/rmm-build \
- *       ./bench_cagra_roaring
+ *       :/mnt/c/Users/maxwb/Development/cu-roaring-filter/build \
+ *       ./bench_brute_force_roaring
  */
 
 #include <cuda_runtime.h>
-#include <cuvs/neighbors/cagra.hpp>
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/common.hpp>
 #include <cuvs/neighbors/roaring_filter.cuh>
@@ -22,7 +25,6 @@
 #include <cu_roaring/detail/utils.cuh>
 #include <cu_roaring/detail/upload_ids.cuh>
 #include <cu_roaring/detail/promote.cuh>
-#include <cu_roaring/detail/decompress.cuh>
 #include <cu_roaring/device/roaring_view.cuh>
 #include <cu_roaring/device/make_view.cuh>
 
@@ -67,7 +69,6 @@ static Stats compute_stats(std::vector<double>& t)
           n};
 }
 
-// Welch's t-test: returns t-statistic and approximate p-value
 static double welch_t(const Stats& a, const Stats& b)
 {
   if (a.std_dev == 0 && b.std_dev == 0) return 0;
@@ -76,14 +77,14 @@ static double welch_t(const Stats& a, const Stats& b)
   return (a.mean - b.mean) / se;
 }
 
-static double recall_at_k(const std::vector<uint32_t>& result,
-                           const std::vector<uint32_t>& gt,
+static double recall_at_k(const std::vector<int64_t>& result,
+                           const std::vector<int64_t>& gt,
                            int k, int n_queries)
 {
   int total_found = 0;
   for (int q = 0; q < n_queries; ++q) {
     for (int i = 0; i < k; ++i) {
-      uint32_t r = result[q * k + i];
+      int64_t r = result[q * k + i];
       for (int j = 0; j < k; ++j) {
         if (r == gt[q * k + j]) { ++total_found; break; }
       }
@@ -102,8 +103,7 @@ static void write_stats_json(FILE* f, const char* prefix, const Stats& s)
 }
 
 // ============================================================================
-// Interleaved A/B benchmark: alternates bitset and roaring each iteration
-// to eliminate ordering bias from warm caches / settled GPU state.
+// Interleaved A/B benchmark
 // ============================================================================
 struct InterleavedResult {
   Stats bitset, roaring;
@@ -114,20 +114,19 @@ template <typename FilterA, typename FilterB>
 InterleavedResult bench_interleaved(
   int warmup, int iters,
   raft::resources& res,
-  const cuvs::neighbors::cagra::search_params& search_params,
-  const cuvs::neighbors::cagra::index<float, uint32_t>& index,
+  const cuvs::neighbors::brute_force::search_params& search_params,
+  const cuvs::neighbors::brute_force::index<float, float>& index,
   raft::device_matrix_view<const float, int64_t> queries,
-  raft::device_matrix_view<uint32_t, int64_t> neighbors,
+  raft::device_matrix_view<int64_t, int64_t> neighbors,
   raft::device_matrix_view<float, int64_t> distances,
   FilterA& filt_a, FilterB& filt_b)
 {
-  // Warmup: alternate A/B
   cudaDeviceSynchronize();
   for (int i = 0; i < warmup; ++i) {
-    cuvs::neighbors::cagra::search(res, search_params, index, queries,
-                                    neighbors, distances, filt_a);
-    cuvs::neighbors::cagra::search(res, search_params, index, queries,
-                                    neighbors, distances, filt_b);
+    cuvs::neighbors::brute_force::search(res, search_params, index, queries,
+                                          neighbors, distances, filt_a);
+    cuvs::neighbors::brute_force::search(res, search_params, index, queries,
+                                          neighbors, distances, filt_b);
   }
   cudaDeviceSynchronize();
 
@@ -138,11 +137,10 @@ InterleavedResult bench_interleaved(
   std::vector<double> times_a(iters), times_b(iters);
 
   for (int i = 0; i < iters; ++i) {
-    // A first on even iterations, B first on odd (balanced ordering)
     auto run = [&](auto& filt) -> double {
       cudaEventRecord(s);
-      cuvs::neighbors::cagra::search(res, search_params, index, queries,
-                                      neighbors, distances, filt);
+      cuvs::neighbors::brute_force::search(res, search_params, index, queries,
+                                            neighbors, distances, filt);
       cudaEventRecord(e);
       cudaEventSynchronize(e);
       float ms;
@@ -177,12 +175,14 @@ int main()
 
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
-  printf("GPU: %s (%d SMs, %.0f MB)\n\n", prop.name, prop.multiProcessorCount,
-         prop.totalGlobalMem / (1024.0 * 1024.0));
+  printf("GPU: %s (%d SMs, %.0f MB VRAM, %.0f MB L2)\n\n",
+         prop.name, prop.multiProcessorCount,
+         prop.totalGlobalMem / (1024.0 * 1024.0),
+         prop.l2CacheSize / (1024.0 * 1024.0));
 
-  constexpr int K         = 10;
-  constexpr int WARMUP    = 20;
-  constexpr int ITERS     = 50;
+  constexpr int K      = 10;
+  constexpr int WARMUP = 10;
+  constexpr int ITERS  = 30;
 
   struct Config {
     const char* name;
@@ -193,41 +193,52 @@ int main()
   };
 
   Config configs[] = {
-    // 1M (dim=128) — selectivity sweep
-    {"1M_d128_0.1pct",  1000000, 128, 100, 0.001},
-    {"1M_d128_1pct",    1000000, 128, 100, 0.01},
-    {"1M_d128_5pct",    1000000, 128, 100, 0.05},
-    {"1M_d128_10pct",   1000000, 128, 100, 0.10},
-    {"1M_d128_25pct",   1000000, 128, 100, 0.25},
-    {"1M_d128_50pct",   1000000, 128, 100, 0.50},
-    // 10M (dim=128) — scale test
-    {"10M_d128_0.1pct", 10000000, 128, 100, 0.001},
-    {"10M_d128_1pct",   10000000, 128, 100, 0.01},
-    {"10M_d128_10pct",  10000000, 128, 100, 0.10},
-    {"10M_d128_50pct",  10000000, 128, 100, 0.50},
-    // 20M (dim=32) — larger scale, more L2 pressure
-    // Dataset: 2.6GB, Graph: 2.6GB, Bitset: 2.4MB
-    {"20M_d32_0.1pct",  20000000, 32, 100, 0.001},
-    {"20M_d32_1pct",    20000000, 32, 100, 0.01},
-    {"20M_d32_10pct",   20000000, 32, 100, 0.10},
-    {"20M_d32_50pct",   20000000, 32, 100, 0.50},
+    // 100K (dim=128) — small scale, fast iteration
+    {"100K_d128_1pct",    100000,  128, 100, 0.01},
+    {"100K_d128_5pct",    100000,  128, 100, 0.05},
+    {"100K_d128_10pct",   100000,  128, 100, 0.10},
+    {"100K_d128_25pct",   100000,  128, 100, 0.25},
+    {"100K_d128_50pct",   100000,  128, 100, 0.50},
+    // 1M (dim=128) — standard scale
+    {"1M_d128_1pct",     1000000,  128, 100, 0.01},
+    {"1M_d128_5pct",     1000000,  128, 100, 0.05},
+    {"1M_d128_10pct",    1000000,  128, 100, 0.10},
+    {"1M_d128_25pct",    1000000,  128, 100, 0.25},
+    {"1M_d128_50pct",    1000000,  128, 100, 0.50},
+    // 5M (dim=128) — larger scale
+    {"5M_d128_1pct",     5000000,  128, 100, 0.01},
+    {"5M_d128_5pct",     5000000,  128, 100, 0.05},
+    {"5M_d128_10pct",    5000000,  128, 100, 0.10},
+    {"5M_d128_25pct",    5000000,  128, 100, 0.25},
+    {"5M_d128_50pct",    5000000,  128, 100, 0.50},
+    // 10M (dim=128)
+    {"10M_d128_1pct",   10000000,  128, 100, 0.01},
+    {"10M_d128_10pct",  10000000,  128, 100, 0.10},
+    {"10M_d128_50pct",  10000000,  128, 100, 0.50},
+    // 20M (dim=128) — dataset ~10GB, tiled GEMM
+    {"20M_d128_1pct",   20000000,  128, 100, 0.01},
+    {"20M_d128_10pct",  20000000,  128, 100, 0.10},
+    {"20M_d128_50pct",  20000000,  128, 100, 0.50},
   };
   constexpr int N_CONFIGS = sizeof(configs) / sizeof(configs[0]);
 
-  FILE* jf = fopen("bench_cagra_roaring_search.json", "w");
-  fprintf(jf, "{\n  \"benchmark\": \"cagra_roaring_search_interleaved\",\n");
+  FILE* jf = fopen("bench_brute_force_roaring_search.json", "w");
+  fprintf(jf, "{\n  \"benchmark\": \"brute_force_roaring_search_interleaved\",\n");
   fprintf(jf, "  \"gpu\": \"%s\",\n  \"n_sms\": %d,\n",
           prop.name, prop.multiProcessorCount);
+  fprintf(jf, "  \"l2_cache_mb\": %.0f,\n", prop.l2CacheSize / (1024.0 * 1024.0));
   fprintf(jf, "  \"k\": %d,\n", K);
+  fprintf(jf, "  \"metric\": \"L2Expanded\",\n");
   fprintf(jf, "  \"warmup\": %d, \"iters\": %d,\n", WARMUP, ITERS);
   fprintf(jf, "  \"methodology\": \"interleaved_AB\",\n");
+  fprintf(jf, "  \"note\": \"bitset uses CSR path for sparsity>=0.9, roaring always uses dense GEMM+mask\",\n");
   fprintf(jf, "  \"results\": [\n");
 
   bool first_result = true;
 
-  // Reuse CAGRA index + dataset when N and DIM don't change
+  // Reuse index + dataset when N and DIM don't change
   int prev_N = -1, prev_DIM = -1;
-  std::unique_ptr<cuvs::neighbors::cagra::index<float, uint32_t>> cagra_idx;
+  std::unique_ptr<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
   raft::device_matrix<float, int64_t> dataset_buf =
     raft::make_device_matrix<float, int64_t>(res, 0, 0);
 
@@ -241,9 +252,10 @@ int main()
            cfg.name, N, DIM, NQ, cfg.filter_pass_rate * 100);
     fflush(stdout);
 
-    // Rebuild dataset + CAGRA index when N or DIM changes
+    // Rebuild dataset + index when N or DIM changes
     if (N != prev_N || DIM != prev_DIM) {
-      printf("  Generating dataset (%d vectors, %d dim)...\n", N, DIM);
+      printf("  Generating dataset (%d vectors, %d dim, %.1f MB)...\n",
+             N, DIM, (double)N * DIM * sizeof(float) / (1024.0 * 1024.0));
       fflush(stdout);
       dataset_buf = raft::make_device_matrix<float, int64_t>(res, N, DIM);
       {
@@ -255,14 +267,13 @@ int main()
         raft::resource::sync_stream(res);
       }
 
-      printf("  Building CAGRA index...\n"); fflush(stdout);
-      cuvs::neighbors::cagra::index_params build_params;
-      build_params.graph_degree              = 32;
-      build_params.intermediate_graph_degree = 48;
-      auto idx = cuvs::neighbors::cagra::build(
+      printf("  Building brute-force index...\n"); fflush(stdout);
+      cuvs::neighbors::brute_force::index_params build_params;
+      build_params.metric = cuvs::distance::DistanceType::L2Expanded;
+      auto idx = cuvs::neighbors::brute_force::build(
         res, build_params, raft::make_const_mdspan(dataset_buf.view()));
-      cagra_idx = std::make_unique<cuvs::neighbors::cagra::index<float, uint32_t>>(std::move(idx));
-      prev_N = N;
+      bf_idx = std::make_unique<cuvs::neighbors::brute_force::index<float, float>>(std::move(idx));
+      prev_N   = N;
       prev_DIM = DIM;
     }
 
@@ -286,6 +297,9 @@ int main()
       if (dist(gen) < cfg.filter_pass_rate) pass_ids.push_back(static_cast<uint32_t>(i));
     printf("  Filter: %zu pass (%.2f%%)\n", pass_ids.size(), 100.0 * pass_ids.size() / N);
 
+    double sparsity = 1.0 - static_cast<double>(pass_ids.size()) / N;
+    const char* bitset_path = sparsity >= 0.9 ? "CSR+SpGEMM" : "dense+mask";
+
     // ---- Build filter variants ----
 
     // Flat bitset
@@ -298,17 +312,16 @@ int main()
     }
     size_t bitset_bytes = (static_cast<size_t>(N) + 31) / 32 * sizeof(uint32_t);
 
-    // Roaring (default threshold)
+    // Roaring bitmap
     auto gpu_roaring = cu_roaring::upload_from_sorted_ids(
       pass_ids.data(), static_cast<uint32_t>(pass_ids.size()),
       static_cast<uint32_t>(N));
-    auto roaring_view = cu_roaring::make_view(gpu_roaring);
 
-    auto roaring_bytes = [](const cu_roaring::GpuRoaring& g) -> size_t {
+    auto roaring_bytes_fn = [](const cu_roaring::GpuRoaring& g) -> size_t {
       return g.n_containers * (sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint16_t))
            + static_cast<size_t>(g.n_bitmap_containers) * 1024 * sizeof(uint64_t);
     };
-    size_t r_bytes = roaring_bytes(gpu_roaring);
+    size_t r_bytes = roaring_bytes_fn(gpu_roaring);
 
     printf("  Memory: bitset=%.1fKB  roaring=%.1fKB (%.1fx)\n",
            bitset_bytes / 1024.0, r_bytes / 1024.0,
@@ -317,17 +330,12 @@ int main()
            gpu_roaring.n_containers,
            gpu_roaring.n_bitmap_containers,
            gpu_roaring.n_array_containers);
+    printf("  Bitset path: %s  |  Roaring path: dense+mask\n", bitset_path);
 
-    auto neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, NQ, K);
-    auto distances = raft::make_device_matrix<float, int64_t>(res, NQ, K);
+    auto neighbors = raft::make_device_matrix<int64_t, int64_t>(res, NQ, K);
+    auto distances_out = raft::make_device_matrix<float, int64_t>(res, NQ, K);
 
-    cuvs::neighbors::cagra::search_params search_params;
-    search_params.itopk_size = 256;
-    // Set filtering_rate explicitly to avoid per-call popcount overhead.
-    // Default is -1.0, which triggers bitset_view.count() (a GPU reduction
-    // kernel + host sync) on EVERY search() call for the bitset path.
-    // Roaring avoids this because cardinality_ is precomputed on the host.
-    search_params.filtering_rate = static_cast<float>(1.0 - cfg.filter_pass_rate);
+    cuvs::neighbors::brute_force::search_params search_params;
 
     // ---- Interleaved benchmark: bitset vs roaring ----
     auto bitset_filt = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(
@@ -335,41 +343,41 @@ int main()
     auto roaring_filt = cuvs::neighbors::filtering::roaring_filter(gpu_roaring);
 
     auto result = bench_interleaved(
-      WARMUP, ITERS, res, search_params, *cagra_idx,
+      WARMUP, ITERS, res, search_params, *bf_idx,
       raft::make_const_mdspan(queries.view()),
-      neighbors.view(), distances.view(),
+      neighbors.view(), distances_out.view(),
       bitset_filt, roaring_filt);
 
-    auto& s_bitset = result.bitset;
+    auto& s_bitset  = result.bitset;
     auto& s_roaring = result.roaring;
 
-    // Get results for recall calculation (run once more)
-    cuvs::neighbors::cagra::search(
-      res, search_params, *cagra_idx,
+    // Get results for recall calculation
+    cuvs::neighbors::brute_force::search(
+      res, search_params, *bf_idx,
       raft::make_const_mdspan(queries.view()),
-      neighbors.view(), distances.view(), bitset_filt);
-    std::vector<uint32_t> r_bitset(static_cast<size_t>(NQ) * K);
+      neighbors.view(), distances_out.view(), bitset_filt);
+    std::vector<int64_t> r_bitset(static_cast<size_t>(NQ) * K);
     raft::update_host(r_bitset.data(), neighbors.data_handle(), r_bitset.size(), stream);
     raft::resource::sync_stream(res);
 
-    cuvs::neighbors::cagra::search(
-      res, search_params, *cagra_idx,
+    cuvs::neighbors::brute_force::search(
+      res, search_params, *bf_idx,
       raft::make_const_mdspan(queries.view()),
-      neighbors.view(), distances.view(), roaring_filt);
-    std::vector<uint32_t> r_roaring(static_cast<size_t>(NQ) * K);
+      neighbors.view(), distances_out.view(), roaring_filt);
+    std::vector<int64_t> r_roaring(static_cast<size_t>(NQ) * K);
     raft::update_host(r_roaring.data(), neighbors.data_handle(), r_roaring.size(), stream);
     raft::resource::sync_stream(res);
 
     double recall_roaring = recall_at_k(r_roaring, r_bitset, K, NQ);
-    double speedup = s_bitset.median / s_roaring.median;
-    double qps_bitset = NQ / (s_bitset.median * 1e-3);
-    double qps_roaring = NQ / (s_roaring.median * 1e-3);
+    double speedup        = s_bitset.median / s_roaring.median;
+    double qps_bitset     = NQ / (s_bitset.median * 1e-3);
+    double qps_roaring    = NQ / (s_roaring.median * 1e-3);
 
-    printf("  bitset:  %.3f ms (std=%.3f, p5=%.3f, p95=%.3f)\n",
-           s_bitset.median, s_bitset.std_dev, s_bitset.p5, s_bitset.p95);
-    printf("  roaring: %.3f ms (std=%.3f, p5=%.3f, p95=%.3f)\n",
+    printf("  bitset:  %.3f ms (std=%.3f, p5=%.3f, p95=%.3f) [%s]\n",
+           s_bitset.median, s_bitset.std_dev, s_bitset.p5, s_bitset.p95, bitset_path);
+    printf("  roaring: %.3f ms (std=%.3f, p5=%.3f, p95=%.3f) [dense+mask]\n",
            s_roaring.median, s_roaring.std_dev, s_roaring.p5, s_roaring.p95);
-    printf("  Speedup: %.2fx  Recall: %.4f  t-stat: %.2f\n",
+    printf("  Speedup: %.3fx  Recall: %.4f  t-stat: %.2f\n",
            speedup, recall_roaring, result.t_stat);
     printf("  QPS: bitset=%.0f  roaring=%.0f\n\n", qps_bitset, qps_roaring);
 
@@ -381,6 +389,8 @@ int main()
     fprintf(jf, "      \"n_vectors\": %d, \"dim\": %d, \"n_queries\": %d,\n", N, DIM, NQ);
     fprintf(jf, "      \"filter_pass_rate\": %.4f, \"n_passing\": %zu,\n",
             cfg.filter_pass_rate, pass_ids.size());
+    fprintf(jf, "      \"sparsity\": %.4f,\n", sparsity);
+    fprintf(jf, "      \"bitset_path\": \"%s\", \"roaring_path\": \"dense+mask\",\n", bitset_path);
     fprintf(jf, "      \"bitset_bytes\": %zu, \"roaring_bytes\": %zu,\n",
             bitset_bytes, r_bytes);
     fprintf(jf, "      \"n_containers\": %u, \"n_bitmap\": %u, \"n_array\": %u,\n",
@@ -401,6 +411,6 @@ int main()
 
   fprintf(jf, "\n  ]\n}\n");
   fclose(jf);
-  printf("=== COMPLETE — results at bench_cagra_roaring_search.json ===\n");
+  printf("=== COMPLETE — results at bench_brute_force_roaring_search.json ===\n");
   return 0;
 }
