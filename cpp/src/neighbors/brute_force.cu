@@ -9,10 +9,17 @@
 #include <cuvs/neighbors/roaring_filter.cuh>
 #include <cu_roaring/device/roaring_warp_query.cuh>
 #include <cu_roaring/detail/to_csr.cuh>
+#include <cu_roaring/detail/filtered_search.cuh>
 
 #include <raft/core/bitset.cuh>
 #include <raft/core/copy.hpp>
+#include <raft/core/resource/cublas_handle.hpp>
 #include <raft/sparse/linalg/sddmm.hpp>
+
+#include <thrust/transform.h>
+
+#include <cstdlib>
+#include <cstring>
 
 namespace cuvs::neighbors::brute_force {
 
@@ -44,6 +51,108 @@ void brute_force_search_roaring(
   auto stream = raft::resource::get_cuda_stream(res);
   IdxT n_dataset = idx.dataset().extent(0);
   float sparsity = 1.0f - static_cast<float>(rf.cardinality_) / rf.n_rows_;
+
+  // Optional third dispatch: schedule-driven brute_force from cu_roaring's
+  // filtered_search.cu. Built via build_schedule(filter, n_rows, db, dim) and
+  // executed via roaring_filtered_search / roaring_filtered_search_fp16.
+  //
+  // The schedule walks the roaring containers and emits per-container GEMM
+  // tasks:
+  //   RUN containers      -> kRange-direct (one wide GEMM over the slice,
+  //                          no gather, no mask; cross-container coalesced)
+  //   ARRAY / sparse BMP  -> gathered into a compact buffer, then a Q*card
+  //                          skinny GEMM
+  //   dense BITMAP        -> kRange-with-mask, masked tile-by-tile in the
+  //                          executor (recent coalescing fix merges
+  //                          contiguous dense-bitmap tasks up to 1M cols)
+  //
+  // This is opt-in via CUVS_ROARING_DISPATCH=schedule because the choice
+  // between SDDMM (current sparse path) and the schedule depends on filter
+  // shape:
+  //   - clustered filters with long runs -> schedule wins by a lot (one
+  //     direct GEMM beats CSR + masked matmul handily)
+  //   - uniform-random sparse filters -> SDDMM and schedule are close
+  //   - sel >> 50% -> existing warp_contains path still slightly faster
+  //     than the schedule's masked-tile dispatch
+  // The right long-term answer is a calibrated auto-dispatch; for now
+  // the env var lets the bench harness sweep all three and the user pin a
+  // path explicitly.
+  const char* dispatch_env = std::getenv("CUVS_ROARING_DISPATCH");
+  bool force_schedule = dispatch_env && std::strcmp(dispatch_env, "schedule") == 0;
+
+  if (force_schedule) {
+    // Reconstruct a GpuRoaring view-equivalent from rf.view_ (same pattern
+    // the SDDMM path below uses).
+    cu_roaring::GpuRoaring tmp_roaring{};
+    tmp_roaring.keys              = const_cast<uint16_t*>(rf.view_.keys);
+    tmp_roaring.types             = reinterpret_cast<cu_roaring::ContainerType*>(
+                                      const_cast<cu_roaring::ContainerTypeD*>(rf.view_.types));
+    tmp_roaring.offsets           = const_cast<uint32_t*>(rf.view_.offsets);
+    tmp_roaring.cardinalities     = const_cast<uint16_t*>(rf.view_.cardinalities);
+    tmp_roaring.n_containers      = rf.view_.n_containers;
+    tmp_roaring.bitmap_data       = const_cast<uint64_t*>(rf.view_.bitmap_data);
+    tmp_roaring.array_data        = const_cast<uint16_t*>(rf.view_.array_data);
+    tmp_roaring.run_data          = const_cast<uint16_t*>(rf.view_.run_data);
+    tmp_roaring.universe_size     = rf.n_rows_;
+    tmp_roaring.total_cardinality = rf.cardinality_;
+    tmp_roaring.negated           = rf.view_.negated;
+
+    IdxT n_queries = queries.extent(0);
+    IdxT dim       = idx.dataset().extent(1);
+    IdxT k         = neighbors.extent(1);
+
+    // build_schedule walks the containers and constructs the task list +
+    // gather buffer. cu_roaring uses cublasHandle_t internally; pull it from
+    // raft resources (raft maintains a per-stream cuBLAS handle).
+    auto cublas = raft::resource::get_cublas_handle(res);
+    auto sched  = cu_roaring::build_schedule(tmp_roaring,
+                                             static_cast<uint32_t>(n_dataset),
+                                             idx.dataset().data_handle(),
+                                             static_cast<uint32_t>(dim),
+                                             stream);
+
+    // cu_roaring writes top-k as uint32 ids + float scores; cuVS wants IdxT
+    // (int64_t) and DistanceT outputs. Allocate a uint32 scratch, copy the
+    // float scores through if DistanceT == float, then cast/promote ids.
+    rmm::device_uvector<uint32_t> tmp_ids(
+        static_cast<size_t>(n_queries) * static_cast<size_t>(k), stream);
+    rmm::device_uvector<float> tmp_scores(
+        static_cast<size_t>(n_queries) * static_cast<size_t>(k), stream);
+
+    if constexpr (std::is_same_v<T, float>) {
+      cu_roaring::roaring_filtered_search(
+          cublas, queries.data_handle(), static_cast<uint32_t>(n_queries),
+          idx.dataset().data_handle(), static_cast<uint32_t>(n_dataset),
+          static_cast<uint32_t>(dim), sched, static_cast<uint32_t>(k),
+          tmp_ids.data(), tmp_scores.data(), stream);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      cu_roaring::roaring_filtered_search_fp16(
+          cublas, queries.data_handle(), static_cast<uint32_t>(n_queries),
+          idx.dataset().data_handle(), static_cast<uint32_t>(n_dataset),
+          static_cast<uint32_t>(dim), sched, static_cast<uint32_t>(k),
+          tmp_ids.data(), tmp_scores.data(), stream);
+    } else {
+      static_assert(std::is_same_v<T, float> || std::is_same_v<T, __half>,
+                    "schedule-driven dispatch supports float and __half only");
+    }
+
+    // uint32 -> IdxT (int64) and float -> DistanceT.
+    thrust::transform(raft::resource::get_thrust_policy(res),
+                      tmp_ids.data(), tmp_ids.data() + tmp_ids.size(),
+                      neighbors.data_handle(),
+                      [] __device__(uint32_t v) { return static_cast<IdxT>(v); });
+    if constexpr (std::is_same_v<DistanceT, float>) {
+      raft::copy(distances.data_handle(), tmp_scores.data(), tmp_scores.size(), stream);
+    } else {
+      thrust::transform(raft::resource::get_thrust_policy(res),
+                        tmp_scores.data(), tmp_scores.data() + tmp_scores.size(),
+                        distances.data_handle(),
+                        [] __device__(float v) { return static_cast<DistanceT>(v); });
+    }
+
+    cu_roaring::free_schedule(sched);
+    return;
+  }
 
   if (sparsity >= 0.9f) {
     // Fused sparse path: roaring → sorted IDs → CSR → SDDMM → epilogue → select_k.
