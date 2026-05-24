@@ -58,7 +58,8 @@ namespace cuvs::neighbors::detail {
 template <typename ElementType      = float,
           typename IndexType        = int64_t,
           typename DistanceT        = float,
-          typename DistanceEpilogue = raft::identity_op>
+          typename DistanceEpilogue = raft::identity_op,
+          typename MaskOp           = std::nullptr_t>
 void tiled_brute_force_knn(const raft::resources& handle,
                            const ElementType* search,  // size (m ,d)
                            const ElementType* index,   // size (n ,d)
@@ -77,7 +78,8 @@ void tiled_brute_force_knn(const raft::resources& handle,
                            const uint32_t* filter_bits               = nullptr,
                            DistanceEpilogue distance_epilogue        = raft::identity_op(),
                            cuvs::neighbors::filtering::FilterType filter_type =
-                             cuvs::neighbors::filtering::FilterType::Bitmap)
+                             cuvs::neighbors::filtering::FilterType::Bitmap,
+                           MaskOp mask_op                            = MaskOp{})
 {
   // Figure out the number of rows/cols to tile for
   size_t tile_rows = 0;
@@ -244,6 +246,17 @@ void tiled_brute_force_knn(const raft::resources& handle,
                            uint32_t bit_idx   = (g_idx) & 31;
                            uint32_t filter    = filter_bits[item_idx];
                            if ((filter & (uint32_t(1) << bit_idx)) == 0) {
+                             distances_ptr[idx] = masked_distance;
+                           }
+                         });
+      } else if constexpr (!std::is_same_v<MaskOp, std::nullptr_t>) {
+        // Generic mask path — used by roaring_filter's warp_contains()
+        thrust::for_each(raft::resource::get_thrust_policy(handle),
+                         count,
+                         count + current_query_size * current_centroid_size,
+                         [=] __device__(IndexType idx) {
+                           IndexType col = j + (idx % current_centroid_size);
+                           if (!mask_op(static_cast<uint32_t>(col))) {
                              distances_ptr[idx] = masked_distance;
                            }
                          });

@@ -383,28 +383,10 @@ void search(raft::resources const& res,
   }
 
   // Try roaring_filter (GPU Roaring bitmap — no decompression needed)
+  // Note: roaring_filter_warp is a type alias for roaring_filter, so this handles both.
   try {
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::roaring_filter&>(sample_filter_ref);
-    search_params params_copy = params;
-    if (params.filtering_rate < 0.0) {
-      auto filtering_rate =
-        (float)(idx.data().n_rows() - sample_filter.cardinality_) / idx.data().n_rows();
-      const float min_filtering_rate = 0.0;
-      const float max_filtering_rate = 0.999;
-      params_copy.filtering_rate =
-        std::min(std::max(filtering_rate, min_filtering_rate), max_filtering_rate);
-    }
-    auto sample_filter_copy = sample_filter;
-    return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT>(
-      res, params_copy, idx, queries, neighbors, distances, sample_filter_copy);
-  } catch (const std::bad_cast&) {
-  }
-
-  // Try roaring_filter_warp (warp-cooperative GPU Roaring)
-  try {
-    auto& sample_filter =
-      dynamic_cast<const cuvs::neighbors::filtering::roaring_filter_warp&>(sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) {
       auto filtering_rate =

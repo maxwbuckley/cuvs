@@ -192,6 +192,7 @@ if(NOT BUILD_CPU_ONLY)
   rapids_cpm_cccl(BUILD_EXPORT_SET cuvs-exports INSTALL_EXPORT_SET cuvs-exports)
   include(cmake/thirdparty/get_raft.cmake)
   include(cmake/thirdparty/get_cutlass.cmake)
+  include(cmake/thirdparty/get_cu_roaring.cmake)
 endif()
 
 if(BUILD_TESTS OR BUILD_C_TESTS)
@@ -313,11 +314,10 @@ if(NOT BUILD_CPU_ONLY)
                INTERFACE_POSITION_INDEPENDENT_CODE ON
                POSITION_INDEPENDENT_CODE ON
   )
-  target_link_libraries(cuvs-cagra-search PRIVATE raft::raft)
+  target_link_libraries(cuvs-cagra-search PRIVATE raft::raft cu_roaring_bitmap)
   target_include_directories(
     cuvs-cagra-search PRIVATE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                               "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../c/include>"
-                              "$<BUILD_INTERFACE:/mnt/c/Users/maxwb/Development/cu-roaring-filter/include>"
   )
   target_compile_options(
     cuvs-cagra-search PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUVS_CXX_FLAGS}>"
@@ -474,6 +474,7 @@ if(NOT BUILD_CPU_ONLY)
     src/neighbors/ivf_flat/ivf_flat_interleaved_scan_half_int64_t_bitset.cu
     src/neighbors/ivf_flat/ivf_flat_interleaved_scan_int8_t_int64_t_bitset.cu
     src/neighbors/ivf_flat/ivf_flat_interleaved_scan_uint8_t_int64_t_bitset.cu
+    src/neighbors/ivf_flat/ivf_flat_interleaved_scan_float_int64_t_roaring.cu
     src/neighbors/ivf_flat/ivf_flat_serialize_float_int64_t.cu
     src/neighbors/ivf_flat/ivf_flat_serialize_half_int64_t.cu
     src/neighbors/ivf_flat/ivf_flat_serialize_int8_t_int64_t.cu
@@ -559,7 +560,7 @@ if(NOT BUILD_CPU_ONLY)
 
   target_link_libraries(
     cuvs_objs
-    PRIVATE raft::raft rmm::rmm ${CUVS_CTK_MATH_DEPENDENCIES}
+    PRIVATE raft::raft rmm::rmm ${CUVS_CTK_MATH_DEPENDENCIES} cu_roaring_bitmap
             $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX> $<TARGET_NAME_IF_EXISTS:hnswlib::hnswlib>
   )
 
@@ -567,7 +568,6 @@ if(NOT BUILD_CPU_ONLY)
     cuvs_objs
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../c/include>"
-    PRIVATE "$<BUILD_INTERFACE:/mnt/c/Users/maxwb/Development/cu-roaring-filter/include>"
     INTERFACE "$<INSTALL_INTERFACE:include>"
   )
 

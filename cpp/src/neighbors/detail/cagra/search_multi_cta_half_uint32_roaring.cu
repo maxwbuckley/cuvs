@@ -16,10 +16,4 @@ instantiate_kernel_selection(
   float,
   CagraSampleFilterWithQueryIdOffset<cuvs::neighbors::filtering::roaring_filter>);
 
-instantiate_kernel_selection(
-  half,
-  uint32_t,
-  float,
-  CagraSampleFilterWithQueryIdOffset<cuvs::neighbors::filtering::roaring_filter_warp>);
-
 }  // namespace cuvs::neighbors::cagra::detail::multi_cta_search

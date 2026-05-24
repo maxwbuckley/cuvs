@@ -10,28 +10,59 @@
  *
  * > python generate_ivf_flat.py
  *
+ * Modified: added roaring_filter dispatch for float/int64_t.
  */
 
 #include <cuvs/neighbors/ivf_flat.hpp>
 
 #include "ivf_flat_search.cuh"
+#include <cuvs/neighbors/roaring_filter.cuh>
+
+// Extern template: the scan kernel for roaring_filter is explicitly instantiated
+// in ivf_flat_interleaved_scan_float_int64_t_roaring.cu
+namespace cuvs::neighbors::ivf_flat::detail {
+extern template void
+ivfflat_interleaved_scan<float,
+                         typename cuvs::spatial::knn::detail::utils::config<float>::value_t,
+                         int64_t,
+                         cuvs::neighbors::filtering::roaring_filter>(
+  const index<float, int64_t>& index,
+  const float* queries,
+  const uint32_t* coarse_query_results,
+  const uint32_t n_queries,
+  const uint32_t queries_offset,
+  const cuvs::distance::DistanceType metric,
+  const uint32_t n_probes,
+  const uint32_t k,
+  const uint32_t max_samples,
+  const uint32_t* chunk_indices,
+  const bool select_min,
+  cuvs::neighbors::filtering::roaring_filter sample_filter,
+  uint32_t* neighbors,
+  float* distances,
+  uint32_t& grid_dim_x,
+  rmm::cuda_stream_view stream);
+}  // namespace cuvs::neighbors::ivf_flat::detail
 
 namespace cuvs::neighbors::ivf_flat {
 
-#define CUVS_INST_IVF_FLAT_SEARCH(T, IdxT)                                      \
-  void search(raft::resources const& handle,                                    \
-              const cuvs::neighbors::ivf_flat::search_params& params,           \
-              const cuvs::neighbors::ivf_flat::index<T, IdxT>& index,           \
-              raft::device_matrix_view<const T, IdxT, raft::row_major> queries, \
-              raft::device_matrix_view<IdxT, IdxT, raft::row_major> neighbors,  \
-              raft::device_matrix_view<float, IdxT, raft::row_major> distances, \
-              const cuvs::neighbors::filtering::base_filter& sample_filter)     \
-  {                                                                             \
-    cuvs::neighbors::ivf_flat::detail::search(                                  \
-      handle, params, index, queries, neighbors, distances, sample_filter);     \
+void search(raft::resources const& handle,
+            const cuvs::neighbors::ivf_flat::search_params& params,
+            const cuvs::neighbors::ivf_flat::index<float, int64_t>& index,
+            raft::device_matrix_view<const float, int64_t, raft::row_major> queries,
+            raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
+            raft::device_matrix_view<float, int64_t, raft::row_major> distances,
+            const cuvs::neighbors::filtering::base_filter& sample_filter)
+{
+  // Try roaring_filter first (pointer-based dynamic_cast, no exception)
+  auto* rf = dynamic_cast<const cuvs::neighbors::filtering::roaring_filter*>(&sample_filter);
+  if (rf) {
+    cuvs::neighbors::ivf_flat::detail::search_with_filtering(
+      handle, params, index, queries, neighbors, distances, *rf);
+    return;
   }
-CUVS_INST_IVF_FLAT_SEARCH(float, int64_t);
-
-#undef CUVS_INST_IVF_FLAT_SEARCH
+  cuvs::neighbors::ivf_flat::detail::search(
+    handle, params, index, queries, neighbors, distances, sample_filter);
+}
 
 }  // namespace cuvs::neighbors::ivf_flat
