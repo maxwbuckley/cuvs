@@ -1,236 +1,85 @@
-cmake_minimum_required(VERSION 3.25)
-project(roaring_bench LANGUAGES CXX CUDA)
+# =============================================================================
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+# SPDX-License-Identifier: Apache-2.0
+# =============================================================================
+#
+# Roaring-bitmap-filtered ANN search benchmarks.
+#
+# This subdirectory is added by cuVS's top-level CMakeLists when
+# CUVS_BUILD_ROARING_BENCH=ON. All targets here link against:
+#   - cuvs                  (the main library; provides brute_force / IVF /
+#                            CAGRA + roaring_filter)
+#   - cu_roaring_bitmap     (fetched by cmake/thirdparty/get_cu_roaring.cmake)
+#   - raft::raft, rmm::rmm  (cuvs's own transitive deps)
+#   - CUDA::cudart, CUDA::cublas, CUDA::curand
+#
+# There are no machine-local paths; a clean clone of cuVS plus
+# `cmake -DCUVS_BUILD_ROARING_BENCH=ON ..` should be enough.
 
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA architectures")
-
-find_package(CUDAToolkit REQUIRED)
-
-# GCC 13 intrinsics fix for nvcc
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --pre-include ${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/nvcc_pre_include.h")
-endif()
-
-# ---------------------------------------------------------------------------
-# Paths: local build tree for ABI-matched headers + libraries
-# ---------------------------------------------------------------------------
-set(CUVS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." CACHE PATH "cuVS source root")
-set(CUVS_BUILD_DIR "${CUVS_ROOT}/build" CACHE PATH "cuVS build directory")
-set(DEPS "${CUVS_BUILD_DIR}/_deps")
-
-# Libraries from local build (NOT conda — we need the roaring_filter dispatch)
-find_library(CUVS_LIB cuvs HINTS ${CUVS_BUILD_DIR} NO_DEFAULT_PATH)
-find_library(RMM_LIB rmm HINTS ${DEPS}/rmm-build NO_DEFAULT_PATH)
-message(STATUS "CUVS_LIB: ${CUVS_LIB}")
-message(STATUS "RMM_LIB: ${RMM_LIB}")
-
-# cu-roaring-filter standalone library
-set(CU_ROARING_DIR "/mnt/c/Users/maxwb/Development/cu-roaring-filter" CACHE PATH "cu-roaring-filter dir")
-find_library(CU_ROARING_LIB cu_roaring_filter HINTS ${CU_ROARING_DIR}/build NO_DEFAULT_PATH)
-find_library(CROARING_LIB roaring HINTS ${CU_ROARING_DIR}/build/third_party/CRoaring/src NO_DEFAULT_PATH)
-message(STATUS "CU_ROARING_LIB: ${CU_ROARING_LIB}")
-message(STATUS "CROARING_LIB: ${CROARING_LIB}")
-
-# ---------------------------------------------------------------------------
-# Include paths from local build tree (ABI-matched with local libcuvs.so)
-# ---------------------------------------------------------------------------
-# CCCL (thrust, cub, libcudacxx) — must come before system CUDA headers
-set(CCCL_SRC "${DEPS}/cccl-src")
-
-# Mirror the exact include paths from the main cuVS build
-# (extracted from compile_commands.json)
-set(CONDA_PREFIX "/home/maxwb/miniconda3" CACHE PATH "Conda environment prefix")
-
-set(BENCH_INCLUDE_DIRS
-    # cuVS C++ and C API headers
-    ${CUVS_ROOT}/include
-    ${CUVS_ROOT}/../c/include
-    # raft (source + generated)
-    ${DEPS}/raft-src/cpp/include
-    ${DEPS}/raft-build/include
-    # rmm (source + generated)
-    ${DEPS}/rmm-src/cpp/include
-    ${DEPS}/rmm-build/include
-    # CCCL (thrust, libcudacxx, cub)
-    ${CCCL_SRC}/thrust
-    ${CCCL_SRC}/libcudacxx/include
-    ${CCCL_SRC}/cub
-    # nvtx3
-    ${DEPS}/nvtx3-src/c/include
-    # conda system headers (rapids_logger, spdlog, dlpack, fmt)
-    ${CONDA_PREFIX}/include
-)
-
-message(STATUS "BENCH_INCLUDE_DIRS: ${BENCH_INCLUDE_DIRS}")
-
-# Common compile definitions (must match main cuVS build)
+set(BENCH_CUDA_FLAGS --extended-lambda --expt-relaxed-constexpr)
 set(BENCH_COMPILE_DEFS
-    CCCL_DISABLE_PDL
-    CUB_DISABLE_NAMESPACE_MAGIC
-    CUB_IGNORE_NAMESPACE_MAGIC_ERROR
-    THRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA
-    THRUST_DISABLE_ABI_NAMESPACE
-    THRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_CPP
-    THRUST_IGNORE_ABI_NAMESPACE_ERROR
-    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
-    RMM_DEPRECATE_LEGACY_MR_INTERFACE
-    RMM_DEPRECATE_MR_DEVICE_HEADERS=1
-    RMM_ENABLE_LEGACY_MR_INTERFACE
-    RAFT_SYSTEM_LITTLE_ENDIAN=1
-    RAFT_HIDE_DEPRECATION_WARNINGS
-    CUDA_API_PER_THREAD_DEFAULT_STREAM
     FMT_HEADER_ONLY=1
     SPDLOG_FMT_EXTERNAL=0
+    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 )
 
-# Common CUDA compile options
-set(BENCH_CUDA_FLAGS --extended-lambda --expt-relaxed-constexpr)
-
-# Allow unresolved symbols at link time — libcuvs.so's transitive deps
-# (librmm.so) are resolved at runtime via RPATH/LD_LIBRARY_PATH.
-# This avoids ABI mismatches if rmm was rebuilt against a different CCCL.
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-shlib-undefined")
-
-# RPATH so the binary finds local libcuvs.so and librmm.so at runtime
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-set(CMAKE_BUILD_RPATH
-    ${CUVS_BUILD_DIR}
-    ${DEPS}/rmm-build
-    ${CU_ROARING_DIR}/build
-)
-
-# ---------------------------------------------------------------------------
-# Helper function to reduce repetition
-# ---------------------------------------------------------------------------
-function(add_bench_target TARGET_NAME SOURCE_FILE)
-    cmake_parse_arguments(ARG "ROARING" "" "" ${ARGN})
-    add_executable(${TARGET_NAME} ${SOURCE_FILE})
-    target_include_directories(${TARGET_NAME} PRIVATE ${BENCH_INCLUDE_DIRS})
-    target_compile_definitions(${TARGET_NAME} PRIVATE ${BENCH_COMPILE_DEFS})
-    set_target_properties(${TARGET_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-    target_compile_options(${TARGET_NAME} PRIVATE
+# Helper: standard cuvs-bench-target wiring. Single TU, links against the
+# in-build cuvs lib + cu_roaring + standard runtime deps.
+function(cuvs_add_roaring_bench target src)
+    add_executable(${target} ${src})
+    target_link_libraries(${target}
+        PRIVATE
+            cuvs
+            cu_roaring_bitmap
+            raft::raft
+            rmm::rmm
+            CUDA::cudart
+            CUDA::cublas
+            CUDA::curand
+    )
+    target_compile_definitions(${target} PRIVATE ${BENCH_COMPILE_DEFS})
+    set_target_properties(${target} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_STANDARD              17
+        CUDA_STANDARD_REQUIRED     ON
+    )
+    target_compile_options(${target} PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_FLAGS}>
     )
-    if(ARG_ROARING)
-        target_include_directories(${TARGET_NAME} PRIVATE
-            ${CU_ROARING_DIR}/include
-            ${CU_ROARING_DIR}/third_party/CRoaring/include)
-        target_link_libraries(${TARGET_NAME} PRIVATE
-            CUDA::cudart ${CUVS_LIB} ${RMM_LIB} ${CU_ROARING_LIB} ${CROARING_LIB}
-        )
-    else()
-        target_link_libraries(${TARGET_NAME} PRIVATE
-            CUDA::cudart ${CUVS_LIB} ${RMM_LIB}
-        )
-    endif()
 endfunction()
 
 # ---------------------------------------------------------------------------
-# Benchmark targets
-# ---------------------------------------------------------------------------
+# End-to-end selectivity sweep — cuVS bitset_filter vs cuVS roaring_filter
+# (SDDMM / warp_contains / schedule-driven, switched via CUVS_ROARING_DISPATCH).
+# Environment knobs: E2E_DTYPE=fp16, E2E_SHAPE=clustered, E2E_SELS=...,
+#                    CUVS_ROARING_DISPATCH=schedule
+cuvs_add_roaring_bench(bench_e2e_sweep bench_e2e_sweep.cu)
 
-# CAGRA search: direct roaring_filter vs bitset_filter
-add_bench_target(bench_cagra_roaring bench_cagra_roaring.cu ROARING)
+# Real-data YFCC-10M sweep — per-query tag-tuple intersection, host vs gpu
+# build, RUN-aware container census.
+cuvs_add_roaring_bench(bench_yfcc_search bench_yfcc_search.cu)
 
-# Comprehensive benchmark (selectivity sweep, multi-AND, E2E)
-add_bench_target(bench_cagra_comprehensive bench_cagra_roaring_comprehensive.cu ROARING)
+# Standalone exercise of cu_roaring's schedule-driven path (sanity bench;
+# does not go through cuvs::brute_force::search dispatch).
+cuvs_add_roaring_bench(bench_schedule_driven_roaring bench_schedule_driven_roaring.cu)
 
-# Brute-force search: roaring_filter vs bitset_filter
-add_bench_target(bench_brute_force_roaring bench_brute_force_roaring.cu ROARING)
+# Synthetic-generator sweep: load roaring .bin filters produced by the
+# roaring-benchmark generator suite. Set SYNTH_FILTER_DIR=/path at run time.
+cuvs_add_roaring_bench(bench_synth_filters bench_synth_filters.cu)
 
-# IVF-Flat search: roaring_filter vs bitset_filter
-add_bench_target(bench_ivf_flat_roaring bench_ivf_flat_roaring.cu ROARING)
+# Brute-force-specific bench (filter shapes against cuvs::brute_force::search).
+cuvs_add_roaring_bench(bench_brute_force_roaring bench_brute_force_roaring.cu)
 
-# Schedule-driven roaring search vs cuVS bitset filter.
-# Uses the cu_roaring build that contains src/filtered_search.cu (the
-# run-optimizations worktree); needs cuBLAS.
-set(SD_ROARING_DIR "/tmp/cu-roaring-runopt" CACHE PATH "cu_roaring filtered_search source")
-find_library(SD_ROARING_LIB cu_roaring_bitmap HINTS ${SD_ROARING_DIR}/build NO_DEFAULT_PATH)
-find_library(SD_CROARING_LIB roaring
-             HINTS ${SD_ROARING_DIR}/build/third_party/CRoaring/src NO_DEFAULT_PATH)
-message(STATUS "SD_ROARING_LIB: ${SD_ROARING_LIB}")
-if(SD_ROARING_LIB AND SD_CROARING_LIB)
-    add_executable(bench_schedule_driven_roaring bench_schedule_driven_roaring.cu)
-    target_include_directories(bench_schedule_driven_roaring PRIVATE
-        ${BENCH_INCLUDE_DIRS}
-        ${SD_ROARING_DIR}/include
-        ${SD_ROARING_DIR}/third_party/CRoaring/include)
-    target_compile_definitions(bench_schedule_driven_roaring PRIVATE ${BENCH_COMPILE_DEFS})
-    set_target_properties(bench_schedule_driven_roaring PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
-    target_compile_options(bench_schedule_driven_roaring PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_FLAGS}>)
-    target_link_libraries(bench_schedule_driven_roaring PRIVATE
-        CUDA::cudart CUDA::cublas CUDA::curand ${CUVS_LIB} ${RMM_LIB}
-        ${SD_ROARING_LIB} ${SD_CROARING_LIB})
+# IVF-Flat bench against the new roaring interleaved-scan instantiation.
+cuvs_add_roaring_bench(bench_ivf_flat_roaring bench_ivf_flat_roaring.cu)
 
-    # Same harness, but loads filters from a directory of CRoaring portable
-    # .bin files (synthetic generators produced by ../../../../roaring-benchmark).
-    add_executable(bench_synth_filters bench_synth_filters.cu)
-    target_include_directories(bench_synth_filters PRIVATE
-        ${BENCH_INCLUDE_DIRS}
-        ${SD_ROARING_DIR}/include
-        ${SD_ROARING_DIR}/third_party/CRoaring/include)
-    target_compile_definitions(bench_synth_filters PRIVATE ${BENCH_COMPILE_DEFS})
-    set_target_properties(bench_synth_filters PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
-    target_compile_options(bench_synth_filters PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_FLAGS}>)
-    target_link_libraries(bench_synth_filters PRIVATE
-        CUDA::cudart CUDA::cublas CUDA::curand ${CUVS_LIB} ${RMM_LIB}
-        ${SD_ROARING_LIB} ${SD_CROARING_LIB})
+# CAGRA bench (refreshed; the _comprehensive bench is data-driven).
+cuvs_add_roaring_bench(bench_cagra_roaring bench_cagra_roaring.cu)
+cuvs_add_roaring_bench(bench_cagra_roaring_comprehensive bench_cagra_roaring_comprehensive.cu)
 
-    # YFCC-10M real filtered search: per-query schedule build + search.
-    add_executable(bench_yfcc_search bench_yfcc_search.cu)
-    target_include_directories(bench_yfcc_search PRIVATE
-        ${BENCH_INCLUDE_DIRS}
-        ${SD_ROARING_DIR}/include
-        ${SD_ROARING_DIR}/third_party/CRoaring/include)
-    target_compile_definitions(bench_yfcc_search PRIVATE ${BENCH_COMPILE_DEFS})
-    set_target_properties(bench_yfcc_search PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
-    target_compile_options(bench_yfcc_search PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_FLAGS}>)
-    target_link_libraries(bench_yfcc_search PRIVATE
-        CUDA::cudart CUDA::cublas ${CUVS_LIB} ${RMM_LIB}
-        ${SD_ROARING_LIB} ${SD_CROARING_LIB})
+# Micro-benches.
+cuvs_add_roaring_bench(bench_throughput bench_throughput.cu)
+cuvs_add_roaring_bench(bench_transfer  bench_transfer.cu)
 
-    # End-to-end selectivity sweep: cuVS bitset vs cu_roaring schedule-driven
-    # search, with H2D copy + setup + search + D2H all inside the timed region.
-    add_executable(bench_e2e_sweep bench_e2e_sweep.cu)
-    target_include_directories(bench_e2e_sweep PRIVATE
-        ${BENCH_INCLUDE_DIRS}
-        ${SD_ROARING_DIR}/include
-        ${SD_ROARING_DIR}/third_party/CRoaring/include)
-    target_compile_definitions(bench_e2e_sweep PRIVATE ${BENCH_COMPILE_DEFS})
-    set_target_properties(bench_e2e_sweep PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
-    target_compile_options(bench_e2e_sweep PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_FLAGS}>)
-    target_link_libraries(bench_e2e_sweep PRIVATE
-        CUDA::cudart CUDA::cublas CUDA::curand ${CUVS_LIB} ${RMM_LIB}
-        ${SD_ROARING_LIB} ${SD_CROARING_LIB})
-else()
-    message(WARNING "cu_roaring_bitmap lib not found — skipping bench_schedule_driven_roaring")
-endif()
-
-# CAGRA profiling harness for nsight compute
-add_bench_target(profile_cagra_roaring profile_cagra_roaring.cu ROARING)
-
-# Transfer + search latency comparison (bitset upload vs CRoaring upload)
-add_bench_target(bench_transfer bench_transfer.cu ROARING)
-target_link_libraries(profile_cagra_roaring PRIVATE CUDA::cudart_static)
-
-# Standalone roaring primitives benchmark (upload, decompress, etc.)
-add_executable(roaring_bench
-    roaring_bench.cu
-    ../../../src/core/roaring/roaring.cu
-)
-target_include_directories(roaring_bench PRIVATE ${BENCH_INCLUDE_DIRS})
-target_link_libraries(roaring_bench PRIVATE CUDA::cudart ${RMM_LIB} ${CUVS_LIB})
-target_compile_definitions(roaring_bench PRIVATE ${BENCH_COMPILE_DEFS})
-set_target_properties(roaring_bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_options(roaring_bench PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${BENCH_CUDA_FLAGS}>
-)
+# Nsight-Compute-friendly entry for profiling CAGRA roaring search.
+cuvs_add_roaring_bench(profile_cagra_roaring profile_cagra_roaring.cu)

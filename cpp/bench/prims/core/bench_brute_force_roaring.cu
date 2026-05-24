@@ -12,7 +12,6 @@
  *   make -j bench_brute_force_roaring
  *   CUDA_CACHE_MAXSIZE=8589934592 \
  *   LD_LIBRARY_PATH=../../../build:../../../build/_deps/rmm-build \
- *       :/mnt/c/Users/maxwb/Development/cu-roaring-filter/build \
  *       ./bench_brute_force_roaring
  */
 

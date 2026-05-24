@@ -48,6 +48,8 @@ option(BUILD_SHARED_LIBS "Build cuvs shared libraries" ON)
 option(BUILD_TESTS "Build cuvs unit-tests" ON)
 option(BUILD_C_LIBRARY "Build cuVS C API library" ON)
 option(BUILD_CUVS_BENCH "Build cuVS ann benchmarks" OFF)
+option(CUVS_BUILD_ROARING_BENCH
+       "Build cuVS prims/core roaring-filter benchmarks (bench_e2e_sweep et al.)" OFF)
 option(BUILD_CAGRA_HNSWLIB "Build CAGRA+hnswlib interface" ON)
 option(BUILD_MG_ALGOS "Build with multi-GPU support" ON)
 option(CUDA_ENABLE_KERNELINFO "Enable kernel resource usage info" OFF)
@@ -827,4 +829,8 @@ endif()
 
 if(BUILD_CUVS_BENCH)
   add_subdirectory(bench/ann/)
+endif()
+
+if(CUVS_BUILD_ROARING_BENCH)
+  add_subdirectory(bench/prims/core/)
 endif()
